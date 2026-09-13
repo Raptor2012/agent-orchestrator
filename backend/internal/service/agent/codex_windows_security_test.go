@@ -29,10 +29,10 @@ func TestWindowsVaultACLPolicyRejectsUntrustedCredentialAccess(t *testing.T) {
 }
 
 func TestWindowsAncestorACLPolicyAllowsReadButRejectsMutation(t *testing.T) {
-	if !codexWindowsAncestorACLIsSafe(true, []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: codexWindowsGenericRead}}) {
+	if !codexWindowsAncestorACLIsSafe([]codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: codexWindowsGenericRead}}) {
 		t.Fatal("read-only ancestor ACL rejected")
 	}
-	if codexWindowsAncestorACLIsSafe(true, []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: codexWindowsDeleteChild}}) {
+	if codexWindowsAncestorACLIsSafe([]codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: codexWindowsDeleteChild}}) {
 		t.Fatal("mutable ancestor ACL accepted")
 	}
 }
@@ -96,7 +96,7 @@ func TestWindowsAncestorACLPolicyAcceptsDefaultSystemDriveRoot(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			aces := []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: mask}}
-			if !codexWindowsAncestorACLIsSafe(true, aces) {
+			if !codexWindowsAncestorACLIsSafe(aces) {
 				t.Fatal("ancestor ACL that only permits creating a new child rejected")
 			}
 			if codexWindowsVaultACLIsSafe(true, aces) {
@@ -113,7 +113,7 @@ func TestWindowsAncestorACLPolicyAcceptsDefaultSystemDriveRoot(t *testing.T) {
 		"generic write": codexWindowsGenericWrite,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if codexWindowsAncestorACLIsSafe(true, []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: mask}}) {
+			if codexWindowsAncestorACLIsSafe([]codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: mask}}) {
 				t.Fatalf("ancestor ACL granting %s to an untrusted principal accepted", name)
 			}
 		})
@@ -127,7 +127,7 @@ func TestWindowsAncestorACLPolicyAcceptsInheritedStandardWrite(t *testing.T) {
 	// or full-control rights.
 	const inheritedStandardWriteMask uint32 = 0x001201BF
 	aces := []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: inheritedStandardWriteMask}}
-	if !codexWindowsAncestorACLIsSafe(true, aces) {
+	if !codexWindowsAncestorACLIsSafe(aces) {
 		t.Fatalf("ancestor ACL rejected inherited standard Write mask %#x", inheritedStandardWriteMask)
 	}
 	if codexWindowsVaultACLIsSafe(true, aces) {
@@ -142,7 +142,7 @@ func TestWindowsAncestorACLPolicyAcceptsInheritedStandardWrite(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			unsafeACEs := []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: inheritedStandardWriteMask | mask}}
-			if codexWindowsAncestorACLIsSafe(true, unsafeACEs) {
+			if codexWindowsAncestorACLIsSafe(unsafeACEs) {
 				t.Fatalf("ancestor ACL accepted inherited standard Write plus %s", name)
 			}
 		})

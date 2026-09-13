@@ -33,14 +33,6 @@ type ShellRuntime interface {
 	IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool, error)
 }
 
-// IsShellTerminalChildAlive reports whether the command inside a shell
-// terminal is still running. Detached terminal hosts may outlive their child
-// to retain scrollback, so callers that coordinate a command workflow must use
-// this instead of treating host liveness as command liveness.
-func (s *Service) IsShellTerminalChildAlive(ctx context.Context, handleID string) (bool, error) {
-	return s.runtime.IsChildAlive(ctx, ports.RuntimeHandle{ID: strings.TrimSpace(handleID)})
-}
-
 // ProjectRootLocator resolves a project id to the directory a shell should
 // start in. The daemon wiring adapts the project service to it.
 type ProjectRootLocator interface {
@@ -92,6 +84,14 @@ type Service struct {
 	// there, rather than inferring "still blocked" from a goroutine that simply
 	// hasn't run yet.
 	onSessionGateWait func(domain.SessionID)
+}
+
+// IsShellTerminalChildAlive reports whether the command inside a shell
+// terminal is still running. Detached terminal hosts may outlive their child
+// to retain scrollback, so callers that coordinate a command workflow must use
+// this instead of treating host liveness as command liveness.
+func (s *Service) IsShellTerminalChildAlive(ctx context.Context, handleID string) (bool, error) {
+	return s.runtime.IsChildAlive(ctx, ports.RuntimeHandle{ID: strings.TrimSpace(handleID)})
 }
 
 // sessionGate is the admission/teardown barrier for one session's scoped

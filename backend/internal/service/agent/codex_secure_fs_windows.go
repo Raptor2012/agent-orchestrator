@@ -187,7 +187,7 @@ func codexWindowsHandleSecurity(handle windows.Handle, requirePrivate bool) (boo
 		}
 		aces = append(aces, ace)
 	}
-	aclSafe := codexWindowsAncestorACLIsSafe(ownerTrusted, aces)
+	aclSafe := ownerTrusted && codexWindowsAncestorACLIsSafe(aces)
 	if requirePrivate {
 		aclSafe = codexWindowsVaultACLIsSafe(ownerTrusted, aces)
 	}

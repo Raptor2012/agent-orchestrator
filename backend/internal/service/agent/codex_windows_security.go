@@ -95,10 +95,7 @@ func codexWindowsVaultACLIsSafe(ownerTrusted bool, aces []codexWindowsACE) bool 
 	return true
 }
 
-func codexWindowsAncestorACLIsSafe(ownerTrusted bool, aces []codexWindowsACE) bool {
-	if !ownerTrusted {
-		return false
-	}
+func codexWindowsAncestorACLIsSafe(aces []codexWindowsACE) bool {
 	for _, ace := range aces {
 		if ace.Allowed && !ace.PrincipalTrusted && ace.Mask&codexWindowsAncestorMutationMask != 0 {
 			return false
