@@ -59,18 +59,20 @@ const codexWindowsMutationMask = codexWindowsWriteData | codexWindowsAppendData 
 	codexWindowsDeleteChild | codexWindowsWriteAttributes | codexWindowsDelete | codexWindowsWriteDAC |
 	codexWindowsWriteOwner | codexWindowsGenericAll | codexWindowsGenericWrite
 
-// codexWindowsAncestorMutationMask drops the two "add a new child" rights from
-// the vault mask. On a directory, FILE_WRITE_DATA is FILE_ADD_FILE and
-// FILE_APPEND_DATA is FILE_ADD_SUBDIRECTORY: both only permit creating a NEW
-// entry beside the vault chain, and neither can rename, delete, or redirect an
-// ancestor that already exists -- that needs DELETE, FILE_DELETE_CHILD,
-// WRITE_DAC, WRITE_OWNER, or a generic right, all of which stay disqualifying.
+// codexWindowsAncestorMutationMask drops the specific rights present in the
+// standard Windows Write permission from the vault mask. On a directory,
+// FILE_WRITE_DATA is FILE_ADD_FILE and FILE_APPEND_DATA is
+// FILE_ADD_SUBDIRECTORY. FILE_WRITE_EA and FILE_WRITE_ATTRIBUTES affect
+// metadata. These rights do not grant DELETE, FILE_DELETE_CHILD, WRITE_DAC,
+// WRITE_OWNER, or a generic right, which all stay disqualifying. Ancestors are
+// also opened without following reparse points and checked for reparse-point
+// metadata separately.
 //
 // Stock Windows grants exactly FILE_ADD_SUBDIRECTORY to Authenticated Users on
 // the system drive root ("Authenticated Users:(AD)" in icacls). Treating that
 // default as an unsafe ancestor made every ancestor walk fail on every Windows
 // machine, so Codex account storage could never be created.
-const codexWindowsAncestorMutationMask = codexWindowsMutationMask &^ (codexWindowsWriteData | codexWindowsAppendData)
+const codexWindowsAncestorMutationMask = codexWindowsMutationMask &^ (codexWindowsWriteData | codexWindowsAppendData | codexWindowsWriteEA | codexWindowsWriteAttributes)
 
 type codexWindowsACE struct {
 	Allowed          bool

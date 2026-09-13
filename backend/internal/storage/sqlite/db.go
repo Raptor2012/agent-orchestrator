@@ -232,6 +232,12 @@ func migrate(db *sql.DB) error {
 	if err := repairRenumberedAgentSwitchMigrationHistory(db); err != nil {
 		return fmt.Errorf("repair renumbered agent-switch migration history: %w", err)
 	}
+	if err := repairRenumberedPRReviewPartialMigrationHistory(db); err != nil {
+		return fmt.Errorf("repair renumbered PR review-partial migration history: %w", err)
+	}
+	if err := repairRenumberedCodexAccountSwitchMigrationHistory(db); err != nil {
+		return fmt.Errorf("repair renumbered Codex account-switch migration history: %w", err)
+	}
 	if err := prepareBurnedSchemaRepairs(db); err != nil {
 		return fmt.Errorf("prepare burned schema repairs: %w", err)
 	}
@@ -1345,6 +1351,202 @@ SELECT COALESCE((
 	return tx.Commit()
 }
 
+// repairRenumberedPRReviewPartialMigrationHistory preserves databases opened by
+// earlier revisions of this branch: the review_partial column first shipped as
+// 0123, a number main later claimed for agent_install_jobs. On those databases
+// goose would skip main's 0123 (its effects missing) and fail 0130 on the
+// duplicate column. Remap the recorded history — review_partial physically
+// present while agent_install_jobs is not identifies the branch build — and
+// re-initialize certainty conservatively, matching the migration default: rows
+// written before the completeness semantics landed carry no reliable signal, so
+// they stay uncertain until the next successful full review fetch.
+func repairRenumberedPRReviewPartialMigrationHistory(db *sql.DB) error {
+	var gooseTable int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'goose_db_version'`,
+	).Scan(&gooseTable); err != nil {
+		return err
+	}
+	if gooseTable == 0 {
+		return nil
+	}
+
+	var reviewPartialColumn int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('pr') WHERE name = 'review_partial'`,
+	).Scan(&reviewPartialColumn); err != nil {
+		return err
+	}
+	if reviewPartialColumn == 0 {
+		return nil
+	}
+
+	// The branch's 0123 ran only on builds predating main's 0123-0129. If
+	// agent_install_jobs exists, main's 0123 already ran and this database took
+	// the migration through 0130 (or never saw the old numbering) — nothing to
+	// remap.
+	var agentInstallJobsTable int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_install_jobs'`,
+	).Scan(&agentInstallJobsTable); err != nil {
+		return err
+	}
+	if agentInstallJobsTable != 0 {
+		return nil
+	}
+
+	var applied123 int
+	if err := db.QueryRow(`
+SELECT COALESCE((
+    SELECT is_applied FROM goose_db_version
+    WHERE version_id = 123 ORDER BY id DESC LIMIT 1
+), 0)`).Scan(&applied123); err != nil {
+		return err
+	}
+	if applied123 == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Release 123 so goose applies main's agent_install_jobs, and record 130 as
+	// applied so goose does not replay the ALTER on the existing column.
+	if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = 123`); err != nil {
+		return err
+	}
+	var applied130 int
+	if err := tx.QueryRow(`
+SELECT COALESCE((
+    SELECT is_applied FROM goose_db_version
+    WHERE version_id = 130 ORDER BY id DESC LIMIT 1
+), 0)`).Scan(&applied130); err != nil {
+		return err
+	}
+	if applied130 == 0 {
+		if _, err := tx.Exec(`INSERT INTO goose_db_version (version_id, is_applied) VALUES (130, 1)`); err != nil {
+			return err
+		}
+	}
+	// The column predates the conservative default; re-initialize to uncertain
+	// so pre-semantics rows cannot publish exact thread counts.
+	if _, err := tx.Exec(`UPDATE pr SET review_partial = TRUE`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// repairRenumberedCodexAccountSwitchMigrationHistory preserves development
+// databases opened while the account-switch branches owned versions 0129 and
+// 0130. Main later assigned those versions to change-log retention and PR
+// review certainty. Physical column presence identifies the old branch
+// migrations: remap their effects to 0140/0141 and release any collided main
+// version whose physical effect is still absent so Goose can apply it.
+func repairRenumberedCodexAccountSwitchMigrationHistory(db *sql.DB) error {
+	var gooseTable int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'goose_db_version'`,
+	).Scan(&gooseTable); err != nil {
+		return err
+	}
+	if gooseTable == 0 {
+		return nil
+	}
+	var cleanupApplied int
+	if err := db.QueryRow(`
+SELECT COALESCE((
+    SELECT is_applied FROM goose_db_version
+    WHERE version_id = 142 ORDER BY id DESC LIMIT 1
+), 0)`).Scan(&cleanupApplied); err != nil {
+		return err
+	}
+	if cleanupApplied != 0 {
+		return nil
+	}
+
+	var restartColumn, sourceKindColumn int
+	if err := db.QueryRow(`
+SELECT (SELECT COUNT(*) FROM pragma_table_info('codex_account_switches') WHERE name = 'restart_running_sessions'),
+       (SELECT COUNT(*) FROM pragma_table_info('codex_account_switches') WHERE name = 'source_kind')`,
+	).Scan(&restartColumn, &sourceKindColumn); err != nil {
+		return err
+	}
+	if restartColumn == 0 && sourceKindColumn == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	latestApplied := func(version int64) (int, error) {
+		var applied int
+		err := tx.QueryRow(`
+SELECT COALESCE((
+    SELECT is_applied FROM goose_db_version
+    WHERE version_id = ? ORDER BY id DESC LIMIT 1
+), 0)`, version).Scan(&applied)
+		return applied, err
+	}
+	markApplied := func(version int64) error {
+		applied, err := latestApplied(version)
+		if err != nil || applied != 0 {
+			return err
+		}
+		_, err = tx.Exec(`INSERT INTO goose_db_version (version_id, is_applied) VALUES (?, 1)`, version)
+		return err
+	}
+
+	if restartColumn != 0 {
+		var retentionIndex int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_change_log_created_at_seq'`,
+		).Scan(&retentionIndex); err != nil {
+			return err
+		}
+		applied129, err := latestApplied(129)
+		if err != nil {
+			return err
+		}
+		if applied129 != 0 && retentionIndex == 0 {
+			if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = 129`); err != nil {
+				return err
+			}
+		}
+		if err := markApplied(140); err != nil {
+			return err
+		}
+	}
+
+	if sourceKindColumn != 0 {
+		var reviewPartialColumn int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info('pr') WHERE name = 'review_partial'`,
+		).Scan(&reviewPartialColumn); err != nil {
+			return err
+		}
+		applied130, err := latestApplied(130)
+		if err != nil {
+			return err
+		}
+		if applied130 != 0 && reviewPartialColumn == 0 {
+			if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = 130`); err != nil {
+				return err
+			}
+		}
+		if err := markApplied(141); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 // schemaRepairs lists the column-level effects of migrations that real
 // installs are known to skip. Issue #3475/#3476: profiles exist whose
 // goose_db_version already records versions 40 through 46 (written by a
@@ -1473,6 +1675,11 @@ BEGIN
     ON conversation_turns(conversation_id, retry_of_turn_id)
     WHERE retry_of_turn_id IS NOT NULL`,
 		}},
+	// 0130_pr_review_partial.sql. Generated PR reads select this column, so a
+	// field database that burned version 130 must not lose it. The default
+	// matches the migration: unknown historical certainty stays partial.
+	{version: 130, table: "pr", column: "review_partial",
+		addDDL: `ALTER TABLE pr ADD COLUMN review_partial BOOLEAN NOT NULL DEFAULT TRUE`},
 }
 
 // reconcileSchema verifies that the columns in schemaRepairs physically exist

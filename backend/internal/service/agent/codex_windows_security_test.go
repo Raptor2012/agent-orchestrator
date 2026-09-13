@@ -119,3 +119,32 @@ func TestWindowsAncestorACLPolicyAcceptsDefaultSystemDriveRoot(t *testing.T) {
 		})
 	}
 }
+
+func TestWindowsAncestorACLPolicyAcceptsInheritedStandardWrite(t *testing.T) {
+	// This is the exact access mask inherited by the two unresolved SIDs on the
+	// affected Windows profile. It contains only specific read/write/execute and
+	// synchronize rights; it does not contain delete, ACL, owner, generic-write,
+	// or full-control rights.
+	const inheritedStandardWriteMask uint32 = 0x001201BF
+	aces := []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: inheritedStandardWriteMask}}
+	if !codexWindowsAncestorACLIsSafe(true, aces) {
+		t.Fatalf("ancestor ACL rejected inherited standard Write mask %#x", inheritedStandardWriteMask)
+	}
+	if codexWindowsVaultACLIsSafe(true, aces) {
+		t.Fatal("vault ACL accepted inherited standard Write mask")
+	}
+
+	for name, mask := range map[string]uint32{
+		"delete":       codexWindowsDelete,
+		"delete child": codexWindowsDeleteChild,
+		"write DAC":    codexWindowsWriteDAC,
+		"write owner":  codexWindowsWriteOwner,
+	} {
+		t.Run(name, func(t *testing.T) {
+			unsafeACEs := []codexWindowsACE{{Allowed: true, PrincipalTrusted: false, Mask: inheritedStandardWriteMask | mask}}
+			if codexWindowsAncestorACLIsSafe(true, unsafeACEs) {
+				t.Fatalf("ancestor ACL accepted inherited standard Write plus %s", name)
+			}
+		})
+	}
+}

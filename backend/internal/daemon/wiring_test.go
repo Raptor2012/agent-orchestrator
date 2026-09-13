@@ -958,17 +958,6 @@ func (f *fakeSessionLifecycle) AcquireSessionInput(domain.SessionID) (func(), bo
 func (f *fakeSessionLifecycle) SessionMutationInProgress(domain.SessionID) bool         { return false }
 func (f *fakeSessionLifecycle) SetReviewerTerminator(sessionmanager.ReviewerTerminator) {}
 func (f *fakeSessionLifecycle) SetHarnessUseGate(sessionmanager.HarnessUseGate)         {}
-func (f *fakeSessionLifecycle) CodexAccountSwitchInProgress() bool                      { return false }
-func (f *fakeSessionLifecycle) StartCodexAccountSwitch(context.Context, ports.CodexAccountSwitchConfig) (domain.CodexAccountSwitch, error) {
-	return domain.CodexAccountSwitch{}, nil
-}
-func (f *fakeSessionLifecycle) RecoverCodexAccountSwitch(context.Context, string) (domain.CodexAccountSwitch, error) {
-	return domain.CodexAccountSwitch{}, nil
-}
-func (f *fakeSessionLifecycle) GetActiveCodexAccountSwitch(context.Context) (domain.CodexAccountSwitch, bool, error) {
-	return domain.CodexAccountSwitch{}, false, nil
-}
-func (f *fakeSessionLifecycle) SetCodexAccountSwitchObserver(func()) {}
 
 // TestWiring_SessionLifecycleInterfaceInvokedByDaemon asserts the
 // sessionLifecycle interface is satisfied by *sessionmanager.Manager (compile
@@ -1016,6 +1005,10 @@ func (r *selectableRuntime) GetOutput(context.Context, ports.RuntimeHandle, int)
 }
 
 func (r *selectableRuntime) IsAlive(context.Context, ports.RuntimeHandle) (bool, error) {
+	return true, nil
+}
+
+func (r *selectableRuntime) IsChildAlive(context.Context, ports.RuntimeHandle) (bool, error) {
 	return true, nil
 }
 

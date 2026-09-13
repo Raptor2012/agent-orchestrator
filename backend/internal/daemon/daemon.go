@@ -23,6 +23,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/modelcatalog"
 	chatdriveracp "github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/acp"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/codexappserver"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
 	chatdriverregistry "github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/registry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/systemexec"
@@ -378,6 +379,9 @@ func Run() error {
 	chatSvc := chatsvc.New(chatsvc.Options{
 		Store:    store,
 		Sessions: store,
+		StopProviderHost: func(ctx context.Context, id domain.SessionID) error {
+			return persistenthost.Shutdown(ctx, cfg.DataDir, string(id))
+		},
 		// Adapts the store's own snapshot type, so the chat service never has to
 		// import the storage layer.
 		Reader: chatsvc.SnapshotReaderFunc(func(ctx context.Context, conversationID string) (chatsvc.ConversationRows, error) {
@@ -423,7 +427,7 @@ func Run() error {
 		Log:      log,
 		NewID:    uuid.NewString,
 		OnAccountChanged: func(sessionID domain.SessionID, generation string, harness domain.AgentHarness) {
-			if harness != domain.HarnessCodex || agentSvc == nil || sessMgr == nil || sessMgr.CodexAccountSwitchInProgress() {
+			if harness != domain.HarnessCodex || agentSvc == nil || agentSvc.CodexAccountSwitchInProgress() {
 				return
 			}
 			rec, ok, readErr := store.GetSession(ctx, sessionID)
@@ -432,7 +436,7 @@ func Run() error {
 			}
 		},
 		OnCodexCapacityChanged: func(sessionID domain.SessionID, generation string, observation ports.CodexCapacityObservation) {
-			if agentSvc == nil || sessMgr == nil || sessMgr.CodexAccountSwitchInProgress() {
+			if agentSvc == nil || agentSvc.CodexAccountSwitchInProgress() {
 				return
 			}
 			rec, ok, readErr := store.GetSession(ctx, sessionID)
@@ -480,7 +484,9 @@ func Run() error {
 		CodexAccountRoot:       filepath.Join(cfg.StateDir, "harnesses", "codex", "accounts"),
 		CodexPendingRoot:       filepath.Join(cfg.StateDir, "harnesses", "codex", "pending-accounts"),
 		CodexSwitchStagingRoot: filepath.Join(cfg.StateDir, "harnesses", "codex", "switch-staging"),
-		CodexGlobalHome:        codexHome, CodexAccountState: store,
+		CodexGlobalHome:        codexHome,
+		CodexAccountState:      store,
+		CodexAccountSwitches:   store,
 		CodexAccounts: codexappserver.NewAccountFactoryWithResolver(func(resolveCtx context.Context) (string, error) {
 			return codexagent.New().ResolveBinary(resolveCtx)
 		}, log),
@@ -498,13 +504,12 @@ func Run() error {
 		}
 		return fmt.Errorf("wire session service: %w", err)
 	}
+	sessionSvc.SetChatProviderPreserver(chatSvc.PreservesProviderOnRestart)
 	sessMgr = wiredSessMgr
 
 	// servers isn't clobbered. See preview_wiring.go (issue #4500).
 	wireManagedPreviewExit(managedPreview, sessionSvc, log)
 	sessMgr.SetTerminalInputGate(termMgr)
-	agentSvc.SetCodexAccountSwitchCoordinator(sessMgr)
-	sessMgr.SetCodexAccountSwitchObserver(agentSvc.PublishCodexAccounts)
 	lifecycleMessenger.Bind(sessionLifecycleMessenger{sessMgr})
 	lcStack.LCM.SetCompletionTerminator(sessMgr)
 	lcStack.LCM.SetSessionInputLease(sessMgr)
@@ -637,6 +642,18 @@ func Run() error {
 		prActions = prsvc.NewActionService(prsvc.ActionDeps{Store: store, Merger: prMerger, Reader: prReader})
 	} else {
 		log.Warn("pr action service disabled: no usable SCM provider")
+	}
+
+	// Durable credential-switch recovery takes the device-global gate before
+	// any session startup can be admitted.
+	if reconcileErr := agentSvc.ReconcileCodexAccountSwitches(ctx); reconcileErr != nil {
+		stop()
+		managedPreview.Close()
+		lcStack.Stop()
+		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
+			log.Error("cdc pipeline shutdown", "err", cdcErr)
+		}
+		return fmt.Errorf("reconcile Codex account switch on boot: %w", reconcileErr)
 	}
 
 	// Durable agent-switch and interface-transition recovery is the startup
@@ -898,6 +915,11 @@ func Run() error {
 		log.Error("agent switch worker shutdown", "err", err)
 	}
 	switchCancel()
+	codexSwitchStopCtx, codexSwitchCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	if err := agentSvc.WaitCodexAccountSwitchWorkers(codexSwitchStopCtx); err != nil {
+		log.Error("Codex account switch worker shutdown", "err", err)
+	}
+	codexSwitchCancel()
 	managedPreview.Close()
 	<-previewDone
 	// Detach chat controllers before stopping the lifecycle stack. Persistent

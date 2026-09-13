@@ -180,6 +180,7 @@ type Service struct {
 	orchestratorLocksMu sync.Mutex
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
 	workspaceCache      *workspaceCache
+	workspaceEditsMu    sync.Mutex
 	// workspaceGroup coalesces concurrent cache-miss compare/status lookups
 	// for the same (session, root): "Expand All" on many files fires that
 	// many GetWorkspaceFile calls at once, and without this each one would
@@ -189,7 +190,14 @@ type Service struct {
 	// deliver activity signals at all. Only capable harnesses are eligible for
 	// the no_signal downgrade: a hook-less harness staying silent forever is
 	// normal, not a broken pipeline. nil means "unknown": never downgrade.
-	signalCapable func(domain.AgentHarness) bool
+	signalCapable         func(domain.AgentHarness) bool
+	chatProviderPreserved func(domain.SessionID) bool
+}
+
+// SetChatProviderPreserver wires the live Chat lifetime observation after both
+// services have been constructed. It performs no provider or filesystem probes.
+func (s *Service) SetChatProviderPreserver(preserves func(domain.SessionID) bool) {
+	s.chatProviderPreserved = preserves
 }
 
 // New wires a controller-facing session service over an internal session Manager.
@@ -999,7 +1007,9 @@ func (s *Service) toSessionWithFacts(rec domain.SessionRecord, prs []domain.PRFa
 	now := s.now()
 	presentation := deriveKanbanPresentation(rec, prs, runs, now, s.harnessSignals(rec.Harness))
 	return domain.Session{
-		SessionRecord:    rec,
+		SessionRecord: rec,
+		ChatProviderPreserved: rec.Mode == domain.SessionModeChat && !rec.IsTerminated &&
+			s.chatProviderPreserved != nil && s.chatProviderPreserved(rec.ID),
 		Status:           deriveStatus(rec, prs, now, s.harnessSignals(rec.Harness)),
 		SCMStatus:        deriveSCMStatus(prs),
 		KanbanColumn:     presentation.Column,
@@ -1038,9 +1048,6 @@ func mapSessionError(err error) error {
 	case errors.Is(err, sessionmanager.ErrAgentExitInProgress):
 		return apierr.Conflict("AGENT_EXIT_IN_PROGRESS",
 			"The agent is already exiting", nil)
-	case errors.Is(err, ports.ErrCodexAccountSwitchInProgress):
-		return apierr.Conflict("CODEX_ACCOUNT_SWITCH_IN_PROGRESS",
-			"AO is switching the global Codex account; Codex session mutations are temporarily blocked", nil)
 	case errors.Is(err, sessionmanager.ErrInterfaceTransitionInProgress):
 		return apierr.Conflict("INTERFACE_TRANSITION_IN_PROGRESS",
 			"This session is already switching interfaces", nil)
@@ -1139,6 +1146,9 @@ func mapSessionError(err error) error {
 		return apierr.Invalid("AGENT_BINARY_NOT_FOUND", err.Error(), nil)
 	case errors.Is(err, ports.ErrRuntimePrerequisite):
 		return apierr.Invalid("RUNTIME_PREREQUISITE_MISSING", err.Error(), nil)
+	case errors.Is(err, ports.ErrRuntimeCommandLineTooLong):
+		return apierr.Invalid("WINDOWS_COMMAND_LINE_TOO_LONG",
+			"The agent launch command exceeds the Windows size limit. Shorten the task or project instructions.", nil)
 	case errors.Is(err, ports.ErrChatUnsupported):
 		var capabilityErr *ports.ChatCapabilityError
 		if errors.As(err, &capabilityErr) {

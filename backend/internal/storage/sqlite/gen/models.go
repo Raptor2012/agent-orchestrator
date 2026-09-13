@@ -171,26 +171,7 @@ type CodexAccountSwitch struct {
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 	CompletedAt             sql.NullTime
-}
-
-type CodexAccountSwitchSession struct {
-	SwitchID                string
-	SessionID               string
-	NativeSessionID         string
-	InterfaceMode           string
-	SourceHandleID          string
-	SourceGeneration        string
-	WasRunning              bool
-	StopState               string
-	RestartState            string
-	ReviewerWasRunning      bool
-	ReviewerSourceHandleID  string
-	ReviewerNativeSessionID string
-	ReviewerStopState       string
-	ReviewerRestartState    string
-	ErrorCode               string
-	StoppedAt               sql.NullTime
-	RestartedAt             sql.NullTime
+	SourceKind              string
 }
 
 type CodexActiveAccount struct {
@@ -234,6 +215,7 @@ type Conversation struct {
 	UsageCost                  sql.NullFloat64
 	UsageCurrency              sql.NullString
 	ActiveBranchID             string
+	OpencodeMode               string
 }
 
 type ConversationActivity struct {
@@ -274,6 +256,25 @@ type ConversationBranch struct {
 	ProviderScopeID        string
 }
 
+type ConversationEditDelivery struct {
+	ConversationID      string
+	ClientMessageID     string
+	RequestJson         string
+	State               string
+	SourceBranchID      string
+	ActiveBranchID      string
+	TurnID              string
+	HandledBySessionID  string
+	ProviderTurnID      string
+	TurnState           string
+	TurnRequestedAt     sql.NullTime
+	RejectionKind       string
+	RejectionMessage    string
+	CreatedAt           time.Time
+	SettledAt           sql.NullTime
+	ProviderWorkStarted int64
+}
+
 type ConversationMessage struct {
 	ID                  string
 	ConversationID      string
@@ -301,6 +302,26 @@ type ConversationProviderEvent struct {
 	PayloadJson     string
 	ReceivedAt      time.Time
 	BranchID        string
+}
+
+type ConversationQueuedEditDelivery struct {
+	ConversationID  string
+	ClientMessageID string
+	RequestHash     string
+	CreatedAt       time.Time
+}
+
+type ConversationSteerDelivery struct {
+	ConversationID   string
+	ClientMessageID  string
+	RequestJson      string
+	State            string
+	ProviderTurnID   string
+	ActivityID       string
+	RejectionKind    string
+	RejectionMessage string
+	CreatedAt        time.Time
+	SettledAt        sql.NullTime
 }
 
 type ConversationTurn struct {
@@ -402,6 +423,8 @@ type PR struct {
 	StateChangedAt           sql.NullTime
 	AutoInjectCI             bool
 	ProviderID               string
+	AuthorAvatarURL          string
+	ReviewPartial            bool
 }
 
 type PRCheck struct {
@@ -473,15 +496,17 @@ type Project struct {
 }
 
 type Review struct {
-	ID               string
-	SessionID        domain.SessionID
-	ProjectID        domain.ProjectID
-	Harness          domain.ReviewerHarness
-	PRURL            string
-	ReviewerHandleID string
-	AgentSessionID   string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	ID                    string
+	SessionID             domain.SessionID
+	ProjectID             domain.ProjectID
+	Harness               domain.ReviewerHarness
+	PRURL                 string
+	ReviewerHandleID      string
+	AgentSessionID        string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	ReviewerActivityState string
+	ReviewerLaunchID      string
 }
 
 type ReviewRun struct {
@@ -604,6 +629,7 @@ type ShellTerminal struct {
 	AppRunID   string
 	CreatedAt  time.Time
 	SessionID  sql.NullString
+	Transient  bool
 }
 
 type TelemetryEvent struct {

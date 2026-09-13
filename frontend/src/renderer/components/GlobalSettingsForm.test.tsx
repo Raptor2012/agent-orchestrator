@@ -166,8 +166,8 @@ beforeEach(async () => {
 	getKeybindings.mockResolvedValue({});
 	setKeybindings.mockImplementation(async (overrides) => overrides);
 	setKeybindingRecording.mockResolvedValue(undefined);
-	getTelemetryPolicy.mockResolvedValue({ eventsEnabled: false, consentGeneration: "generation-off", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, state: "applied", environmentVeto: false, durabilitySupported: true });
-	setTelemetryEvents.mockResolvedValue({ eventsEnabled: true, consentGeneration: "generation-on", updatedAt: "2026-08-28T10:15:31.000Z", acknowledged: true, state: "applied", environmentVeto: false, durabilitySupported: true });
+	getTelemetryPolicy.mockResolvedValue({ eventsEnabled: false, consentGeneration: "generation-off", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true });
+	setTelemetryEvents.mockResolvedValue({ eventsEnabled: true, consentGeneration: "generation-on", updatedAt: "2026-08-28T10:15:31.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true });
 	onTelemetryPolicy.mockReturnValue(() => undefined);
 	// Locale defaults to English so existing copy assertions stay green.
 	await appI18n.changeLanguage("en");
@@ -180,7 +180,7 @@ beforeEach(async () => {
 		saveError: false,
 	});
 	useUiStore.setState({ developerMode: false });
-	useTelemetryPolicyStore.setState({ view: { eventsEnabled: false, consentGeneration: "generation-off", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, state: "applied", environmentVeto: false, durabilitySupported: true }, loaded: true, saving: false, saveError: false });
+	useTelemetryPolicyStore.setState({ view: { eventsEnabled: false, consentGeneration: "generation-off", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true }, loaded: true, saving: false, saveError: false });
 	document.documentElement.lang = "en";
 });
 
@@ -189,6 +189,13 @@ describe("GlobalSettingsForm", () => {
 		renderForm("general");
 		expect(await screen.findByLabelText("Settings")).toBeInTheDocument();
 		expect(document.querySelector('[data-section="browserProfiles"]')).not.toBeInTheDocument();
+	});
+
+	it("keeps download history inside the Browser settings page", async () => {
+		renderForm("browserProfiles");
+		expect(await screen.findByLabelText("Settings")).toBeInTheDocument();
+		expect(document.querySelector('[data-section="browserProfiles"]')).toBeInTheDocument();
+		expect(document.querySelector('[data-section="downloads"]')).toBeInTheDocument();
 	});
 
 	it("renders the settings sections", async () => {
@@ -256,11 +263,32 @@ describe("GlobalSettingsForm", () => {
 	});
 
 	it("shows pending daemon cleanup without claiming opt-out completed", async () => {
-		setTelemetryEvents.mockResolvedValue({ eventsEnabled: false, consentGeneration: "generation-off-2", updatedAt: "2026-08-28T10:15:31.000Z", acknowledged: false, state: "cleanup_pending", environmentVeto: false, durabilitySupported: true, reason: "daemon_cleanup_pending" });
-		useTelemetryPolicyStore.setState({ view: { eventsEnabled: true, consentGeneration: "generation-on", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, state: "applied", environmentVeto: false, durabilitySupported: true }, loaded: true });
+		setTelemetryEvents.mockResolvedValue({ eventsEnabled: false, consentGeneration: "generation-off-2", updatedAt: "2026-08-28T10:15:31.000Z", acknowledged: false, consentRenewalRequired: false, state: "cleanup_pending", environmentVeto: false, durabilitySupported: true, reason: "daemon_cleanup_pending" });
+		useTelemetryPolicyStore.setState({ view: { eventsEnabled: true, consentGeneration: "generation-on", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true }, loaded: true });
 		const user = userEvent.setup(); renderForm();
 		await user.click(await screen.findByRole("switch", { name: "Share error events" }));
 		expect(await screen.findByText("Telemetry is off locally. Daemon cleanup is still pending.")).toBeInTheDocument();
+	});
+
+	it("names the platform restriction instead of claiming cleanup keeps retrying", async () => {
+		useTelemetryPolicyStore.setState({ view: { eventsEnabled: false, consentGeneration: "generation-off", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: false, consentRenewalRequired: false, state: "cleanup_failed", environmentVeto: false, durabilitySupported: false, reason: "durability_unsupported" }, loaded: true });
+		renderForm();
+		expect(await screen.findByText("Enabling is unavailable on this platform because durable consent writes are not supported.")).toBeInTheDocument();
+		expect(screen.queryByText("Telemetry cleanup failed. Reporting remains disabled while cleanup retries.")).not.toBeInTheDocument();
+	});
+
+	it("does not promise retries for the fail-closed view when the controller is unavailable", async () => {
+		useTelemetryPolicyStore.setState({ view: { eventsEnabled: false, consentGeneration: "unavailable", updatedAt: new Date(0).toISOString(), acknowledged: false, consentRenewalRequired: false, state: "cleanup_failed", environmentVeto: true, durabilitySupported: false, reason: "invalid_authority" }, loaded: true });
+		renderForm();
+		expect(await screen.findByText("Enabling is unavailable on this platform because durable consent writes are not supported.")).toBeInTheDocument();
+		expect(screen.queryByText("Telemetry cleanup failed. Reporting remains disabled while cleanup retries.")).not.toBeInTheDocument();
+	});
+
+	it("names the release gate when a saved opt-in cannot be honoured", async () => {
+		useTelemetryPolicyStore.setState({ view: { eventsEnabled: true, consentGeneration: "generation-on", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true, reason: "release_blocked" }, loaded: true });
+		renderForm();
+		expect(await screen.findByText("Error reporting is disabled by this release's safety gate.")).toBeInTheDocument();
+		expect(screen.queryByText("Telemetry is off locally. Daemon cleanup is still pending.")).not.toBeInTheDocument();
 	});
 
 	it("selects Git Bash as the default Windows terminal", async () => {
@@ -416,6 +444,34 @@ describe("GlobalSettingsForm", () => {
 		await waitFor(() => expect(screen.getByTestId("installed-update-channel")).toHaveTextContent("Nightly"));
 	});
 
+	it("shows a repeated timeout once and keeps manual retry available", async () => {
+		const message = "Update check timed out. Check your connection and try again.";
+		updGetStatus.mockResolvedValue({ state: "error", message, checkError: message });
+		renderForm("updates");
+		await screen.findByText(message);
+		expect(screen.getAllByText(message)).toHaveLength(1);
+		const retry = screen.getByRole("button", { name: "Check for updates" });
+		expect(retry).toBeEnabled();
+		await userEvent.click(retry);
+		expect(updCheck).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves a check failure beside a staged update", async () => {
+		const message = "Update check timed out. Check your connection and try again.";
+		updGetStatus.mockResolvedValue({ state: "downloaded", version: "2.0.0", checkError: message });
+		renderForm("updates");
+		expect(await screen.findByText(message)).toBeVisible();
+		expect(screen.getAllByText(message)).toHaveLength(1);
+		expect(screen.getByRole("button", { name: "Install Update" })).toBeEnabled();
+	});
+
+	it("preserves a different check failure beside an install error", async () => {
+		updGetStatus.mockResolvedValue({ state: "error", message: "Installation failed", checkError: "Update check timed out" });
+		renderForm("updates");
+		expect(await screen.findByText("Installation failed")).toBeVisible();
+		expect(screen.getByText("Update check timed out")).toBeVisible();
+	});
+
 	it("shows an explicit idle update state and triggers a manual check", async () => {
 		renderForm();
 		await waitFor(() => expect(screen.getByTestId("app-version")).toHaveTextContent("v1.4.0"));
@@ -437,9 +493,9 @@ describe("GlobalSettingsForm", () => {
 		await userEvent.click(button);
 
 		expect(button).toBeDisabled();
-		expect(button).toHaveTextContent("Checking for updates…");
+		expect(button).toHaveTextContent("Checking now…");
 		expect(button.querySelector("svg")).toHaveClass("animate-spin");
-		expect(screen.getByTestId("update-status-line")).toHaveTextContent("Checking for updates…");
+		expect(screen.getByTestId("update-status-line")).toHaveTextContent("Checking now…");
 
 		act(() => finishCheck());
 		await waitFor(() => expect(button).toBeEnabled(), { timeout: 1_500 });
@@ -459,7 +515,7 @@ describe("GlobalSettingsForm", () => {
 		const requestId = updCheck.mock.calls[0]?.[0]?.requestId;
 		expect(requestId).toMatch(/^manual-update-/);
 		act(() => emit({ state: "not-available", checkedAt: Date.now() }));
-		expect(screen.getByTestId("update-status-line")).toHaveTextContent("Checking for updates…");
+		expect(screen.getByTestId("update-status-line")).toHaveTextContent("Checking now…");
 		expect(button).toBeDisabled();
 
 		act(() => emit({ state: "not-available", checkedAt: Date.now(), requestId }));
@@ -488,14 +544,14 @@ describe("GlobalSettingsForm", () => {
 		});
 
 		await waitFor(
-			() => expect(screen.getByTestId("update-status-line")).toHaveTextContent("Downloaded. Restart to finish updating."),
+			() => expect(screen.getByTestId("update-status-line")).toHaveTextContent("Ready to install."),
 			{ timeout: 1_500 },
 		);
-		expect(screen.getByRole("button", { name: "Restart & install" })).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Install Update" })).toBeInTheDocument();
 		// The check control stays available alongside the restart action. Hiding it
 		// once something was staged left a user whose staged build would not
 		// install with a single dead button and no way to re-check.
-		const recheck = screen.getByRole("button", { name: "Check for updates" });
+		const recheck = await screen.findByRole("button", { name: "Check for updates" }, { timeout: 2_000 });
 		expect(recheck).toBeEnabled();
 	});
 
@@ -509,7 +565,7 @@ describe("GlobalSettingsForm", () => {
 		updCheck.mockResolvedValue(undefined);
 		renderForm();
 
-		const button = await screen.findByRole("button", { name: "Checking for updates…" });
+		const button = await screen.findByRole("button", { name: "Checking now…" });
 		expect(button).toBeEnabled();
 		await userEvent.click(button);
 
@@ -522,8 +578,8 @@ describe("GlobalSettingsForm", () => {
 		updGetStatus.mockResolvedValue({ state: "not-available", checkedAt });
 		renderForm();
 
-		const formatted = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" }).format(checkedAt);
-		expect(await screen.findByTestId("update-checked-at")).toHaveTextContent(`Last checked ${formatted}`);
+		const formatted = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "medium" }).format(checkedAt);
+		expect(await screen.findByTestId("update-checked-at")).toHaveTextContent(formatted);
 		expect(screen.getByTestId("update-status-line")).toHaveTextContent("You're on the latest version.");
 	});
 
@@ -541,7 +597,7 @@ describe("GlobalSettingsForm", () => {
 		expect(updDownload).toHaveBeenCalled();
 	});
 
-	it("offers Restart & install once downloaded and asks before quitting", async () => {
+	it("offers Install Update once downloaded and asks before quitting", async () => {
 		let emit: (s: { state: string; version?: string; requestId?: string }) => void = () => undefined;
 		updOnStatus.mockImplementation((cb: (s: unknown) => void) => {
 			emit = cb as typeof emit;
@@ -550,7 +606,7 @@ describe("GlobalSettingsForm", () => {
 		renderForm();
 		await screen.findByRole("button", { name: "Check for updates" });
 		act(() => emit({ state: "downloaded", version: "1.2.3" }));
-		const installBtn = await screen.findByRole("button", { name: /Restart & install/ });
+		const installBtn = await screen.findByRole("button", { name: /Install Update/ });
 		await userEvent.click(installBtn);
 
 		// Installing quits the app, which costs a turn on any chat session running
@@ -654,10 +710,10 @@ describe("GlobalSettingsForm", () => {
 
 		await waitFor(() => expect(writeText).toHaveBeenCalledTimes(2));
 		expect(writeText.mock.calls[0][0]).toContain("Daemon: unknown");
-		expect(writeText.mock.calls[1][0]).toContain("To: prateek@untrivial.ai");
+		expect(writeText.mock.calls[1][0]).toContain("To: prasad@untrivial.ai");
 		expect(writeText.mock.calls[1][0]).toContain("AO feedback");
 		expect(openExternal).toHaveBeenCalledWith("https://discord.com/invite/UZv7JjxbwG");
-		expect(openExternal).toHaveBeenCalledWith(expect.stringContaining("mailto:prateek@untrivial.ai"));
+		expect(openExternal).toHaveBeenCalledWith(expect.stringContaining("mailto:prasad@untrivial.ai"));
 		expect(open).not.toHaveBeenCalled();
 	});
 
@@ -718,4 +774,25 @@ describe("GlobalSettingsForm", () => {
 		act(() => emit({ state: "downloaded", version: "1.3.0", requestId }));
 		await waitFor(() => expect(updInstall).toHaveBeenCalled());
 	});
+});
+
+it("keeps running version separate while live download progress becomes install readiness without remounting", async () => {
+	let emit!: (status: import("../../main/update-settings").UpdateStatus) => void;
+	updOnStatus.mockImplementation((listener) => { emit = listener; return () => undefined; });
+	renderForm("updates");
+	await screen.findByTestId("app-version");
+	act(() => emit({ state: "downloading", version: "2.0.0" }));
+	expect(screen.getByText("Starting download…")).toBeVisible();
+	expect(screen.queryByRole("button", { name: "Update to v2.0.0" })).toBeNull();
+	act(() => emit({ state: "downloading", version: "2.0.0", percent: 42, transferred: 42_000_000, total: 100_000_000 }));
+	expect(screen.getByText("42% downloaded")).toBeVisible();
+	expect(screen.getByText("42.0 / 100.0 MB")).toBeVisible();
+	expect(screen.getByText("Updating to v2.0.0")).toBeVisible();
+	expect(screen.getByTestId("app-version")).toHaveTextContent("v1.4.0");
+	act(() => emit({ state: "preparing", version: "2.0.0", percent: 100, staged: { version: "2.0.0", stagedAt: 10, escalated: false, ready: false } }));
+	expect(screen.getByText("Preparing update…")).toBeVisible();
+	expect(screen.queryByRole("button", { name: "Install Update" })).toBeNull();
+	act(() => emit({ state: "downloaded", version: "2.0.0" }));
+	expect(screen.getByRole("button", { name: "Install Update" })).toBeEnabled();
+	expect(screen.getByTestId("app-version")).toHaveTextContent("v1.4.0");
 });
