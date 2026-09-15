@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-func TestMigration0142RemovesRetiredCodexAccountSwitchState(t *testing.T) {
+func TestMigration0148RemovesRetiredCodexAccountSwitchState(t *testing.T) {
 	for _, row := range []struct {
 		id, phase, failureCode, wantPhase, wantCode string
 		terminal                                    bool
@@ -16,7 +16,7 @@ func TestMigration0142RemovesRetiredCodexAccountSwitchState(t *testing.T) {
 	} {
 		t.Run(row.id, func(t *testing.T) {
 			db := openTestDB(t)
-			upTo(t, db, 141)
+			upTo(t, db, 147)
 			now := time.Now().UTC().Truncate(time.Second)
 			if _, err := db.Exec(`INSERT INTO codex_account_switches (
 			id, source_account_id, target_account_id, idempotency_key,
@@ -28,7 +28,7 @@ func TestMigration0142RemovesRetiredCodexAccountSwitchState(t *testing.T) {
 				t.Fatalf("seed %s: %v", row.id, err)
 			}
 
-			upTo(t, db, 142)
+			upTo(t, db, 148)
 
 			for _, name := range []string{"codex_account_switch_sessions", "restart_running_sessions"} {
 				var count int

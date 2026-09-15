@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 	"testing/fstest"
 
@@ -12,9 +13,16 @@ func TestMigrateRepairsRenumberedCodexAccountSwitchHistory(t *testing.T) {
 	for _, tt := range []struct {
 		name              string
 		includeSourceKind bool
+		includeCleanup    bool
+		baseVersion       int64
+		restartVersion    int64
 	}{
-		{name: "restart_policy_only"},
-		{name: "restart_policy_and_source_kind", includeSourceKind: true},
+		{name: "restart_policy_only", baseVersion: 128, restartVersion: 129},
+		{name: "restart_policy_and_source_kind", includeSourceKind: true, baseVersion: 128, restartVersion: 129},
+		{name: "second_numbering_restart_only", baseVersion: 139, restartVersion: 140},
+		{name: "second_numbering_source_kind", includeSourceKind: true, baseVersion: 139, restartVersion: 140},
+		{name: "second_numbering_cleanup", includeSourceKind: true, includeCleanup: true, baseVersion: 139, restartVersion: 140},
+		{name: "main_already_applied", includeSourceKind: true, baseVersion: 145, restartVersion: 146},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dataDir := t.TempDir()
@@ -24,21 +32,28 @@ func TestMigrateRepairsRenumberedCodexAccountSwitchHistory(t *testing.T) {
 			}
 			db.SetMaxOpenConns(1)
 			t.Cleanup(func() { _ = db.Close() })
-			upTo(t, db, 128)
+			upTo(t, db, tt.baseVersion)
 
-			restartMigration, err := migrationsFS.ReadFile("migrations/0140_codex_account_switch_restart_policy.sql")
+			restartMigration, err := migrationsFS.ReadFile("migrations/0146_codex_account_switch_restart_policy.sql")
 			if err != nil {
 				t.Fatal(err)
 			}
 			legacy := fstest.MapFS{
-				"migrations/0129_codex_account_switch_restart_policy.sql": &fstest.MapFile{Data: restartMigration},
+				fmt.Sprintf("migrations/%04d_codex_account_switch_restart_policy.sql", tt.restartVersion): &fstest.MapFile{Data: restartMigration},
 			}
 			if tt.includeSourceKind {
-				sourceMigration, readErr := migrationsFS.ReadFile("migrations/0141_codex_switch_source_kind.sql")
+				sourceMigration, readErr := migrationsFS.ReadFile("migrations/0147_codex_switch_source_kind.sql")
 				if readErr != nil {
 					t.Fatal(readErr)
 				}
-				legacy["migrations/0130_codex_switch_source_kind.sql"] = &fstest.MapFile{Data: sourceMigration}
+				legacy[fmt.Sprintf("migrations/%04d_codex_switch_source_kind.sql", tt.restartVersion+1)] = &fstest.MapFile{Data: sourceMigration}
+			}
+			if tt.includeCleanup {
+				cleanupMigration, readErr := migrationsFS.ReadFile("migrations/0148_codex_account_switch_cleanup.sql")
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				legacy[fmt.Sprintf("migrations/%04d_codex_account_switch_cleanup.sql", tt.restartVersion+2)] = &fstest.MapFile{Data: cleanupMigration}
 			}
 
 			gooseMu.Lock()
@@ -56,6 +71,9 @@ func TestMigrateRepairsRenumberedCodexAccountSwitchHistory(t *testing.T) {
 
 			if err := migrate(db); err != nil {
 				t.Fatalf("migrate legacy Codex database: %v", err)
+			}
+			if err := migrate(db); err != nil {
+				t.Fatalf("reopen migrated Codex database: %v", err)
 			}
 
 			for _, column := range []string{"source_kind"} {
@@ -78,7 +96,7 @@ func TestMigrateRepairsRenumberedCodexAccountSwitchHistory(t *testing.T) {
 			if removedRestartColumn != 0 {
 				t.Fatalf("restart_running_sessions count = %d, want 0", removedRestartColumn)
 			}
-			for _, version := range []int64{129, 130, 140, 141, 142} {
+			for _, version := range []int64{129, 130, 140, 141, 142, 146, 147, 148} {
 				var applied int
 				if err := db.QueryRow(`
 SELECT COALESCE((
@@ -109,6 +127,16 @@ SELECT COALESCE((
 			}
 			if reviewPartial != 1 {
 				t.Fatalf("review_partial count = %d, want 1", reviewPartial)
+			}
+			var nullableProject, checkpointState, checkpointUnsettled int
+			if err := db.QueryRow(`
+SELECT (SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'project_id' AND "notnull" = 0),
+       (SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'conversation_checkpoint_state'),
+       (SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'conversation_checkpoint_unsettled')`).Scan(&nullableProject, &checkpointState, &checkpointUnsettled); err != nil {
+				t.Fatal(err)
+			}
+			if nullableProject != 1 || checkpointState != 1 || checkpointUnsettled != 1 {
+				t.Fatalf("collided main schema missing: nullable project=%d, checkpoint=%d, unsettled=%d", nullableProject, checkpointState, checkpointUnsettled)
 			}
 		})
 	}

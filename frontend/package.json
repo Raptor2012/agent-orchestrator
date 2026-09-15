@@ -1,7 +1,7 @@
 {
 	"name": "agent-orchestrator",
 	"productName": "Agent Orchestrator",
-	"version": "0.10.3",
+	"version": "0.13.0",
 	"private": true,
 	"description": "Electron + TypeScript frontend for the agent-orchestrator rewrite",
 	"author": "Agent Orchestrator",
@@ -20,6 +20,7 @@
 		"predev": "npm run build:daemon -- --dev && node ./scripts/ensure-browser-runtime.mjs && npm run build:acp-runtime",
 		"dev": "electron-forge start",
 		"dev:web": "VITE_NO_ELECTRON=1 vite --config vite.renderer.config.ts",
+		"build": "npm run package",
 		"prepackage": "npm run build:daemon && npm run build:tmux && npm run browser-runtime:prepare && npm run build:acp-runtime",
 		"package": "electron-forge package",
 		"premake": "npm run build:daemon && npm run build:tmux && npm run browser-runtime:prepare && npm run build:acp-runtime",

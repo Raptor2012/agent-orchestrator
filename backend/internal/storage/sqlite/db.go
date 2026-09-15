@@ -1440,10 +1440,10 @@ SELECT COALESCE((
 }
 
 // repairRenumberedCodexAccountSwitchMigrationHistory preserves development
-// databases opened while the account-switch branches owned versions 0129 and
-// 0130. Main later assigned those versions to change-log retention and PR
-// review certainty. Physical column presence identifies the old branch
-// migrations: remap their effects to 0140/0141 and release any collided main
+// databases opened while the account-switch branches owned versions 0129/0130
+// or 0140-0142. Main later assigned those versions to other migrations.
+// Physical schema identifies the old branch migrations: remap their effects
+// to 0146-0148 and release any collided main
 // version whose physical effect is still absent so Goose can apply it.
 func repairRenumberedCodexAccountSwitchMigrationHistory(db *sql.DB) error {
 	var gooseTable int
@@ -1459,7 +1459,7 @@ func repairRenumberedCodexAccountSwitchMigrationHistory(db *sql.DB) error {
 	if err := db.QueryRow(`
 SELECT COALESCE((
     SELECT is_applied FROM goose_db_version
-    WHERE version_id = 142 ORDER BY id DESC LIMIT 1
+    WHERE version_id = 148 ORDER BY id DESC LIMIT 1
 ), 0)`).Scan(&cleanupApplied); err != nil {
 		return err
 	}
@@ -1477,6 +1477,11 @@ SELECT (SELECT COUNT(*) FROM pragma_table_info('codex_account_switches') WHERE n
 	if restartColumn == 0 && sourceKindColumn == 0 {
 		return nil
 	}
+	var legacySessionTable int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'codex_account_switch_sessions'`).Scan(&legacySessionTable); err != nil {
+		return err
+	}
+	cleanedUp := sourceKindColumn != 0 && restartColumn == 0 && legacySessionTable == 0
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -1502,7 +1507,7 @@ SELECT COALESCE((
 		return err
 	}
 
-	if restartColumn != 0 {
+	if restartColumn != 0 || cleanedUp {
 		var retentionIndex int
 		if err := tx.QueryRow(
 			`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_change_log_created_at_seq'`,
@@ -1518,7 +1523,7 @@ SELECT COALESCE((
 				return err
 			}
 		}
-		if err := markApplied(140); err != nil {
+		if err := markApplied(146); err != nil {
 			return err
 		}
 	}
@@ -1539,8 +1544,34 @@ SELECT COALESCE((
 				return err
 			}
 		}
-		if err := markApplied(141); err != nil {
+		if err := markApplied(147); err != nil {
 			return err
+		}
+	}
+	if cleanedUp {
+		if err := markApplied(148); err != nil {
+			return err
+		}
+	}
+	// The second branch numbering collided with standalone sessions and
+	// checkpoint provenance. Only release a version when its main schema is
+	// absent; already-applied main migrations must not run their ALTERs twice.
+	for _, repair := range []struct {
+		version int64
+		query   string
+	}{
+		{140, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'project_id' AND "notnull" = 0`},
+		{141, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'conversation_checkpoint_state'`},
+		{142, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'conversation_checkpoint_unsettled'`},
+	} {
+		var present int
+		if err := tx.QueryRow(repair.query).Scan(&present); err != nil {
+			return err
+		}
+		if present == 0 {
+			if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = ?`, repair.version); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1713,6 +1744,17 @@ func reconcileSchema(db *sql.DB) error {
 	}
 	if err := reconcileHarnessConstraint(db); err != nil {
 		return err
+	}
+	// A missing column fails reads loudly; a missing revision trigger silently
+	// disables every session CAS. Do not admit that database as healthy.
+	var revisionColumn, revisionTrigger int
+	if err := db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'revision'),
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'sessions' AND name = 'sessions_revision_update')`).Scan(&revisionColumn, &revisionTrigger); err != nil {
+		return fmt.Errorf("schema verification: inspect session revision fence: %w", err)
+	}
+	if revisionColumn > 0 && revisionTrigger != 1 {
+		return errors.New("schema verification: sessions_revision_update trigger is missing; restore the session revision trigger before starting AO")
 	}
 	return nil
 }

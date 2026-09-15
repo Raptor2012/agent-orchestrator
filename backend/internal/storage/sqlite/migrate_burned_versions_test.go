@@ -144,9 +144,15 @@ var shippedMigrations = map[int64]string{
 	137: "0137_conversation_edit_delivery.sql",
 	138: "0138_conversation_edit_dispatch_boundary.sql",
 	139: "0139_conversation_steer_delivery.sql",
-	140: "0140_codex_account_switch_restart_policy.sql",
-	141: "0141_codex_switch_source_kind.sql",
-	142: "0142_codex_account_switch_cleanup.sql",
+	140: "0140_standalone_sessions.sql",
+	141: "0141_conversation_checkpoint_provenance.sql",
+	142: "0142_conversation_checkpoint_unsettled.sql",
+	143: "0143_conversation_checkpoint_turn.sql",
+	144: "0144_session_revision.sql",
+	145: "0145_native_checkpoint_evidence.sql",
+	146: "0146_codex_account_switch_restart_policy.sql",
+	147: "0147_codex_switch_source_kind.sql",
+	148: "0148_codex_account_switch_cleanup.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
