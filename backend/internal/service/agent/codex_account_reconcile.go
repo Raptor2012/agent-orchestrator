@@ -413,6 +413,15 @@ func (m *codexAccountManager) reconcileGlobalInner(ctx context.Context) error {
 	credentialChanged := false
 	imported := false
 	if match == codexCredentialMatchNone {
+		// An opaque token can identify an existing saved credential by exact
+		// match, but cannot establish the identity of a new managed account.
+		if identity.ProviderAccountID == "" && identity.Method != domain.CodexAuthMethodAPIKey {
+			if err := m.setActivePointer(ctx, ""); err != nil {
+				return deviceReconciliationStateFailure(err)
+			}
+			m.setUnmanagedGlobal("Device Codex account", identity.Method, nil, "global_account_unverified", "AO could not verify the device's current Codex account.")
+			return deviceReconciliationFailure("global_account_unverified", false)
+		}
 		var importErr error
 		record, importErr = m.importGlobalCredential(globalCredential, identity)
 		if importErr != nil {

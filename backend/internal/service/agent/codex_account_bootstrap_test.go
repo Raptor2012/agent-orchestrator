@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -55,6 +56,66 @@ func TestCodexAccountStoreAndDeviceReconciliationNeverOpenProvider(t *testing.T)
 	view := manager.cached()
 	if view.ActiveAccountID != testAccountID || len(view.Accounts) != 1 || !view.Accounts[0].Active || view.UnmanagedGlobalAccount != nil {
 		t.Fatalf("imported device account = %#v", view)
+	}
+}
+
+func TestCodexDeviceReconciliationRejectsUnidentifiedCredential(t *testing.T) {
+	for _, hadActiveAccount := range []bool{false, true} {
+		t.Run(fmt.Sprintf("previous_active=%t", hadActiveAccount), func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			globalHome := filepath.Join(root, "global")
+			if err := ensurePrivateDirectory(globalHome); err != nil {
+				t.Fatal(err)
+			}
+			globalPath := filepath.Join(globalHome, codexCredentialFilename)
+			state := &fakeCodexAccountStateStore{}
+			var attempts atomic.Int32
+			factory := &fakeCodexAccountFactory{open: func(ports.CodexAccountContext) (ports.CodexAccountClient, error) {
+				attempts.Add(1)
+				return nil, errors.New("reconciliation must remain local")
+			}}
+			manager := newCodexAccountManager(ctx, filepath.Join(root, "accounts"), filepath.Join(root, "pending"), filepath.Join(root, "staging"), globalHome, factory, state, nil)
+			service := &Service{codexAccounts: manager}
+			if err := service.WaitCodexAccountStoreReady(ctx); err != nil {
+				t.Fatal(err)
+			}
+			wantAccounts := 0
+			if hadActiveAccount {
+				if err := writeGlobalCredentialAtomic(globalPath, testOAuthCredential("known-account", "known-token")); err != nil {
+					t.Fatal(err)
+				}
+				if err := service.EnsureCodexDeviceAccountReconciled(ctx); err != nil {
+					t.Fatal(err)
+				}
+				wantAccounts = 1
+			}
+			credential := []byte(`{"tokens":{"access_token":"test-only"}}`)
+			if err := writeGlobalCredentialAtomic(globalPath, credential); err != nil {
+				t.Fatal(err)
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				err := service.EnsureCodexDeviceAccountReconciled(ctx)
+				var apiError *apierr.Error
+				if !errors.As(err, &apiError) || apiError.Code != "CODEX_DEVICE_ACCOUNT_UNVERIFIED" || apiError.Details["reasonCode"] != "global_account_unverified" {
+					t.Fatalf("attempt %d: expected unverified error, got %#v", attempt, err)
+				}
+				view := manager.cached()
+				if view.ActiveAccountID != "" || state.active.AccountID != "" || view.UnmanagedGlobalAccount == nil || len(view.Accounts) != wantAccounts {
+					t.Fatalf("unidentified credential was adopted: %#v", view)
+				}
+				if view.DeviceReconciliation.Status != domain.CodexDeviceReconciliationBlocked || view.DeviceReconciliation.ActiveAccountVerified {
+					t.Fatalf("unidentified credential was verified: %#v", view.DeviceReconciliation)
+				}
+			}
+			if attempts.Load() != 0 {
+				t.Fatalf("local reconciliation opened %d provider clients", attempts.Load())
+			}
+			unchanged, err := os.ReadFile(globalPath)
+			if err != nil || !bytes.Equal(unchanged, credential) {
+				t.Fatalf("device credential was changed: %v", err)
+			}
+		})
 	}
 }
 

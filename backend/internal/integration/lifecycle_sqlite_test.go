@@ -301,8 +301,9 @@ func TestDelegateEndpointDoesNotDependOnCodexDeviceReconciliation(t *testing.T) 
 	if err := agents.EnsureCodexDeviceAccountReconciled(ctx); err == nil {
 		t.Fatal("unmatched signed-out device credential was treated as a managed account")
 	}
-	if factory.opens.Load() != 2 {
-		t.Fatalf("account client opens = %d, want 2", factory.opens.Load())
+	// Reconciliation is local-only, including rejection of unidentified tokens.
+	if factory.opens.Load() != 0 {
+		t.Fatalf("local reconciliation opened %d account clients", factory.opens.Load())
 	}
 	accounts, err := agents.CachedCodexAccounts(ctx)
 	if err != nil {
