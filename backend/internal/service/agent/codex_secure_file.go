@@ -330,10 +330,6 @@ func removeCodexFileIdentityBound(path string) error {
 	return removeCodexFileIdentityBoundWith(path, inspectCodexFile)
 }
 
-func removeCodexDeviceFileIdentityBound(path string) error {
-	return removeCodexFileIdentityBoundWith(path, inspectCodexDeviceFile)
-}
-
 func removeCodexFileIdentityBoundWith(path string, inspect func(string, bool) (codexFileState, error)) error {
 	dir := filepath.Dir(path)
 	if _, dirErr := os.Lstat(dir); dirErr == nil {
