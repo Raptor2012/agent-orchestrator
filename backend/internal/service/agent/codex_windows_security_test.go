@@ -148,3 +148,58 @@ func TestWindowsAncestorACLPolicyAcceptsInheritedStandardWrite(t *testing.T) {
 		})
 	}
 }
+
+func TestWindowsDeviceCredentialACLPolicy(t *testing.T) {
+	tests := []struct {
+		name         string
+		ownerTrusted bool
+		aces         []codexWindowsACE
+		want         bool
+	}{
+		{name: "trusted owner only", ownerTrusted: true, want: true},
+		{name: "sandbox read", ownerTrusted: true, aces: []codexWindowsACE{{Allowed: true, PrincipalSandbox: true, Mask: codexWindowsGenericRead}}, want: true},
+		{name: "sandbox write", ownerTrusted: true, aces: []codexWindowsACE{{Allowed: true, PrincipalSandbox: true, Mask: codexWindowsWriteData}}},
+		{name: "untrusted read", ownerTrusted: true, aces: []codexWindowsACE{{Allowed: true, Mask: codexWindowsReadData}}},
+		{name: "untrusted write", ownerTrusted: true, aces: []codexWindowsACE{{Allowed: true, Mask: codexWindowsWriteData}}},
+		{name: "unmapped SID full control", ownerTrusted: true, aces: []codexWindowsACE{{Allowed: true, Mask: codexWindowsGenericAll}}},
+		{name: "deny does not grant access", ownerTrusted: true, aces: []codexWindowsACE{{Allowed: false, Mask: codexWindowsGenericAll}}, want: true},
+		{name: "untrusted owner", ownerTrusted: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := codexWindowsDeviceCredentialACLIsSafe(tt.ownerTrusted, tt.aces); got != tt.want {
+				t.Fatalf("device credential ACL safety = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWindowsDeviceCredentialACLRepairPolicy(t *testing.T) {
+	tests := []struct {
+		name         string
+		ownerCurrent bool
+		aces         []codexWindowsACE
+		want         bool
+	}{
+		{name: "legacy unmapped SID", ownerCurrent: true, aces: []codexWindowsACE{{Allowed: true, PrincipalUnmapped: true, Mask: codexWindowsLegacyStaleSIDMask}}, want: true},
+		{name: "legacy unmapped SID plus sandbox read", ownerCurrent: true, aces: []codexWindowsACE{{Allowed: true, PrincipalUnmapped: true, Mask: codexWindowsLegacyStaleSIDMask}, {Allowed: true, PrincipalSandbox: true, Mask: codexWindowsGenericRead}}, want: true},
+		{name: "unmapped SID generic all", ownerCurrent: true, aces: []codexWindowsACE{{Allowed: true, PrincipalUnmapped: true, Mask: codexWindowsGenericAll}}},
+		{name: "resolvable untrusted reader", ownerCurrent: true, aces: []codexWindowsACE{{Allowed: true, Mask: codexWindowsGenericRead}}},
+		{name: "sandbox writer", ownerCurrent: true, aces: []codexWindowsACE{{Allowed: true, PrincipalSandbox: true, Mask: codexWindowsWriteData}}},
+		{name: "not current owner", aces: []codexWindowsACE{{Allowed: true, PrincipalUnmapped: true, Mask: codexWindowsLegacyStaleSIDMask}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := codexWindowsDeviceCredentialACLIsRepairable(tt.ownerCurrent, tt.aces); got != tt.want {
+				t.Fatalf("device credential ACL repairability = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWindowsVaultPolicyRejectsUnmappedPrincipals(t *testing.T) {
+	aces := []codexWindowsACE{{Allowed: true, Mask: codexWindowsReadData}}
+	if codexWindowsVaultACLIsSafe(true, aces) {
+		t.Fatal("AO-owned vault accepted an unavailable principal")
+	}
+}

@@ -27,7 +27,7 @@ func (m *codexAccountManager) openLoginTerminal(ctx context.Context, targetAccou
 		return CodexAccountLoginTerminalStart{}, apierr.Unavailable("CODEX_ACCOUNT_MANAGEMENT_UNAVAILABLE", "Codex login terminal is unavailable")
 	}
 	targetAccountID = strings.TrimSpace(targetAccountID)
-	deviceCredential, deviceState, deviceErr := readCodexFileState(m.globalCredentialPath(), true)
+	deviceCredential, deviceState, deviceErr := readCodexDeviceFileState(m.globalCredentialPath(), true)
 	if deviceErr != nil {
 		if replaceDevice {
 			return CodexAccountLoginTerminalStart{}, apierr.Conflict("CODEX_GLOBAL_ACCOUNT_CHANGED", "The device Codex account could not be prepared for sign-in", nil)
@@ -319,7 +319,7 @@ func (m *codexAccountManager) verifyLogin(ctx context.Context, operationID strin
 		})
 	} else {
 		if replaceDevice {
-			latestCredential, latestState, latestErr := readCodexFileState(m.globalCredentialPath(), true)
+			latestCredential, latestState, latestErr := readCodexDeviceFileState(m.globalCredentialPath(), true)
 			if latestErr != nil || !sameCodexFileState(op.deviceState, latestState) || !bytes.Equal(op.deviceCredential, latestCredential) {
 				return m.finishLogin(operationID, domain.CodexAccountLoginFailed, domain.CodexAccountLoginReasonFailed, "The device Codex account changed. Try again.", nil), nil
 			}
@@ -444,7 +444,7 @@ func (m *codexAccountManager) verifyLogin(ctx context.Context, operationID strin
 // subsequent replacement is allowed to overwrite.
 func (m *codexAccountManager) verifyActiveAccountCredentialLocked(ctx context.Context, record codexAccountRecord) ([]byte, error) {
 	globalPath := m.globalCredentialPath()
-	credential, admitted, err := readCodexFileState(globalPath, false)
+	credential, admitted, err := readCodexDeviceFileState(globalPath, false)
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +456,7 @@ func (m *codexAccountManager) verifyActiveAccountCredentialLocked(ctx context.Co
 	}
 	observation, readErr := client.Read(verifyCtx, false)
 	_ = client.Close()
-	latestCredential, latest, latestErr := readCodexFileState(globalPath, false)
+	latestCredential, latest, latestErr := readCodexDeviceFileState(globalPath, false)
 	if latestErr != nil {
 		return nil, latestErr
 	}

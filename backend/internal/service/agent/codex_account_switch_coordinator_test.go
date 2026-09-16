@@ -238,7 +238,7 @@ func TestCodexAccountSwitchCoordinatorActivatesSavedAccountWhenDeviceCredentialI
 	if active.AccountID != target.Snapshot.ID || active.Revision != 1 {
 		t.Fatalf("active account = %#v", active)
 	}
-	installed, err := readOpaqueCredential(manager.globalCredentialPath())
+	installed, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
 	if err != nil {
 		t.Fatal(err)
 	}

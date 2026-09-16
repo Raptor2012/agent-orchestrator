@@ -615,7 +615,7 @@ func (s *Service) VerifyCurrentCodexAccount(ctx context.Context, accountID strin
 		return apierr.NotImplemented("CODEX_GLOBAL_CREDENTIAL_STORE_UNSUPPORTED", "Device-global Codex account switching requires file-backed credentials")
 	}
 	globalPath := s.codexAccounts.globalCredentialPath()
-	globalCredential, admitted, credentialErr := readCodexFileState(globalPath, false)
+	globalCredential, admitted, credentialErr := readCodexDeviceFileState(globalPath, false)
 	if credentialErr != nil {
 		return apierr.Conflict("CODEX_GLOBAL_ACCOUNT_CHANGED", "The device Codex account could not be confirmed", nil)
 	}
@@ -627,7 +627,7 @@ func (s *Service) VerifyCurrentCodexAccount(ctx context.Context, accountID strin
 	}
 	observation, readErr := client.Read(verifyCtx, false)
 	_ = client.Close()
-	latestCredential, latest, latestErr := readCodexFileState(globalPath, false)
+	latestCredential, latest, latestErr := readCodexDeviceFileState(globalPath, false)
 	if readErr != nil || (observation.Authentication != domain.AgentAuthenticationAuthorized && observation.Authentication != domain.AgentAuthenticationNotApplicable) ||
 		latestErr != nil || !sameCodexFileState(admitted, latest) || !bytes.Equal(globalCredential, latestCredential) ||
 		!s.codexAccounts.observationAndCredentialIdentifyRecord(record, observation, latestCredential) {
@@ -669,7 +669,7 @@ func (s *Service) CheckpointAndActivateCodexAccount(ctx context.Context, sourceK
 	if sourceKind != domain.CodexAccountSwitchSourceNone && s.codexAccounts.validateGlobalCredentialStore() != nil {
 		return domain.CodexActiveAccount{}, apierr.NotImplemented("CODEX_GLOBAL_CREDENTIAL_STORE_UNSUPPORTED", "Device-global Codex account switching requires file-backed credentials")
 	}
-	globalCredential, globalState, err := readCodexFileState(s.codexAccounts.globalCredentialPath(), sourceKind == domain.CodexAccountSwitchSourceNone)
+	globalCredential, globalState, err := readCodexDeviceFileState(s.codexAccounts.globalCredentialPath(), sourceKind == domain.CodexAccountSwitchSourceNone)
 	if err != nil {
 		return domain.CodexActiveAccount{}, apierr.NotImplemented("CODEX_GLOBAL_CREDENTIAL_STORE_UNSUPPORTED", "Device-global Codex account switching requires file-backed credentials")
 	}
@@ -690,7 +690,7 @@ func (s *Service) CheckpointAndActivateCodexAccount(ctx context.Context, sourceK
 		if readErr != nil {
 			return domain.CodexActiveAccount{}, apierr.Conflict("CODEX_GLOBAL_ACCOUNT_CHANGED", "The device Codex account changed before switching", nil)
 		}
-		latestGlobal, latestState, latestErr := readCodexFileState(s.codexAccounts.globalCredentialPath(), false)
+		latestGlobal, latestState, latestErr := readCodexDeviceFileState(s.codexAccounts.globalCredentialPath(), false)
 		if latestErr != nil || (!distinguishableCodexIdentity(observation) && !sameCodexFileState(globalState, latestState)) || !s.codexAccounts.observationAndCredentialIdentifyRecord(record, observation, latestGlobal) {
 			return domain.CodexActiveAccount{}, apierr.Conflict("CODEX_GLOBAL_ACCOUNT_CHANGED", "The device Codex account changed before switching", nil)
 		}
@@ -757,7 +757,7 @@ func (s *Service) RestoreCodexAccountCredential(ctx context.Context, switchID st
 	}
 	targetCredential, targetErr := readOpaqueCredential(filepath.Join(target.Home, codexCredentialFilename))
 	globalPath := s.codexAccounts.globalCredentialPath()
-	globalCredential, globalState, globalErr := readCodexFileState(globalPath, sourceKind == domain.CodexAccountSwitchSourceNone)
+	globalCredential, globalState, globalErr := readCodexDeviceFileState(globalPath, sourceKind == domain.CodexAccountSwitchSourceNone)
 	if (sourceKind != domain.CodexAccountSwitchSourceNone && sourceErr != nil) || targetErr != nil || globalErr != nil {
 		return apierr.Unavailable("CODEX_ACCOUNT_SWITCH_ACTIVATION_UNCONFIRMED", "The previous Codex credential could not be restored")
 	}
@@ -786,7 +786,7 @@ func (s *Service) RestoreCodexAccountCredential(ctx context.Context, switchID st
 		if !bytes.Equal(globalCredential, targetCredential) {
 			return ports.ErrCodexGlobalAccountChanged
 		}
-		latestGlobal, latestErr := readOpaqueCredential(globalPath)
+		latestGlobal, latestErr := readDeviceOpaqueCredential(globalPath)
 		if latestErr != nil || !bytes.Equal(latestGlobal, targetCredential) {
 			return ports.ErrCodexGlobalAccountChanged
 		}
@@ -794,7 +794,7 @@ func (s *Service) RestoreCodexAccountCredential(ctx context.Context, switchID st
 			return apierr.Unavailable("CODEX_ACCOUNT_SWITCH_ACTIVATION_UNCONFIRMED", "The previous Codex credential could not be restored")
 		}
 	}
-	admittedCredential, admitted, admittedErr := readCodexFileState(globalPath, false)
+	admittedCredential, admitted, admittedErr := readCodexDeviceFileState(globalPath, false)
 	if admittedErr != nil || !bytes.Equal(admittedCredential, sourceCredential) {
 		return ports.ErrCodexGlobalAccountChanged
 	}
@@ -813,7 +813,7 @@ func (s *Service) RestoreCodexAccountCredential(ctx context.Context, switchID st
 	}
 	observation, readErr := client.Read(verifyCtx, false)
 	_ = client.Close()
-	latestCredential, latest, latestErr := readCodexFileState(globalPath, false)
+	latestCredential, latest, latestErr := readCodexDeviceFileState(globalPath, false)
 	if readErr != nil ||
 		(observation.Authentication != domain.AgentAuthenticationAuthorized && observation.Authentication != domain.AgentAuthenticationNotApplicable) ||
 		latestErr != nil || !sameCodexFileState(admitted, latest) || !bytes.Equal(admittedCredential, latestCredential) ||

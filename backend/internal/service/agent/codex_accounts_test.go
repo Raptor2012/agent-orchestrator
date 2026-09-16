@@ -536,7 +536,7 @@ func TestNativeLoginVerificationDoesNotReplaceExistingDeviceAccount(t *testing.T
 	if completed.Status != domain.CodexAccountLoginCompleted || completed.Account == nil || completed.Account.Active {
 		t.Fatalf("completed login = %#v", completed)
 	}
-	current, err := readOpaqueCredential(manager.globalCredentialPath())
+	current, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
 	if err != nil || !bytes.Equal(current, original) {
 		t.Fatalf("existing device credential changed: %q, %v", current, err)
 	}
@@ -590,7 +590,7 @@ func TestNativeLoginVerificationSavesAccountWhileDeviceReconciliationRetries(t *
 	if _, err := readOpaqueCredential(filepath.Join(manager.catalog.root, testAccountID, codexCredentialHomeDirectory, codexCredentialFilename)); err != nil {
 		t.Fatalf("saved account credential: %v", err)
 	}
-	if credential, err := readOpaqueCredential(manager.globalCredentialPath()); err != nil || string(credential) != "opaque-login-credential" {
+	if credential, err := readDeviceOpaqueCredential(manager.globalCredentialPath()); err != nil || string(credential) != "opaque-login-credential" {
 		t.Fatalf("first saved account was not installed on the device: %q, %v", credential, err)
 	}
 }
@@ -626,7 +626,7 @@ func TestDeviceReloginAtomicallyReplacesUnmanagedCredential(t *testing.T) {
 	if completed.Status != domain.CodexAccountLoginCompleted || completed.AccountID != testAccountID || completed.Account == nil || !completed.Account.Active {
 		t.Fatalf("device login result = %#v", completed)
 	}
-	installed, err := readOpaqueCredential(manager.globalCredentialPath())
+	installed, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
 	if err != nil || string(installed) != "opaque-login-credential" {
 		t.Fatalf("installed credential = %q, err=%v", installed, err)
 	}
@@ -668,7 +668,7 @@ func TestDeviceReloginFailurePreservesCredentialAndCreatesNoAccount(t *testing.T
 	if completed.Status != domain.CodexAccountLoginFailed {
 		t.Fatalf("device login result = %#v", completed)
 	}
-	installed, err := readOpaqueCredential(manager.globalCredentialPath())
+	installed, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
 	if err != nil || !bytes.Equal(installed, original) {
 		t.Fatalf("failed login changed device credential = %q, err=%v", installed, err)
 	}
@@ -696,7 +696,7 @@ func TestDeviceReloginCancellationPreservesCredential(t *testing.T) {
 	if _, err := manager.cancelLogin(context.Background(), started.Operation.OperationID); err != nil {
 		t.Fatal(err)
 	}
-	installed, err := readOpaqueCredential(manager.globalCredentialPath())
+	installed, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
 	if err != nil || !bytes.Equal(installed, original) {
 		t.Fatalf("cancelled login changed device credential = %q, err=%v", installed, err)
 	}
@@ -806,7 +806,7 @@ func TestActiveReauthenticationRevalidatesAndReplacesTheDeviceCredential(t *test
 	if completed.Status != domain.CodexAccountLoginCompleted || completed.Account == nil || !completed.Account.Active {
 		t.Fatalf("completed reauthentication = %#v", completed)
 	}
-	globalCredential, err := readOpaqueCredential(manager.globalCredentialPath())
+	globalCredential, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
 	if err != nil || string(globalCredential) != "opaque-login-credential" {
 		t.Fatalf("device credential = %q, err=%v", globalCredential, err)
 	}
@@ -1089,7 +1089,7 @@ func TestLogoutActiveAPIKeyRejectsExternalCredentialReplacement(t *testing.T) {
 	if err := manager.logout(context.Background(), record.Snapshot.ID); err == nil {
 		t.Fatal("logout accepted an externally replaced API-key credential")
 	}
-	global, err := readOpaqueCredential(manager.globalCredentialPath())
+	global, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
 	if err != nil || string(global) != "external-api-key" {
 		t.Fatalf("external global credential = %q, %v", global, err)
 	}
@@ -2063,7 +2063,7 @@ func TestSwitchFromDeviceOnlySourceRestoresPrivateCheckpoint(t *testing.T) {
 	if err := fixture.service.RestoreCodexAccountCredential(context.Background(), switchID, domain.CodexAccountSwitchSourceDevice, "", fixture.target.Snapshot.ID); err != nil {
 		t.Fatal(err)
 	}
-	restored, err := readOpaqueCredential(fixture.manager.globalCredentialPath())
+	restored, err := readDeviceOpaqueCredential(fixture.manager.globalCredentialPath())
 	if err != nil || !bytes.Equal(restored, deviceCredential) {
 		t.Fatalf("restored device credential = %q, err=%v", restored, err)
 	}
@@ -2133,7 +2133,7 @@ func TestDeviceOnlyRollbackNeverOverwritesExternalCredential(t *testing.T) {
 	if err := fixture.service.RestoreCodexAccountCredential(context.Background(), switchID, domain.CodexAccountSwitchSourceDevice, "", fixture.target.Snapshot.ID); !errors.Is(err, ports.ErrCodexGlobalAccountChanged) {
 		t.Fatalf("rollback error = %v, want external-change protection", err)
 	}
-	current, err := readOpaqueCredential(fixture.manager.globalCredentialPath())
+	current, err := readDeviceOpaqueCredential(fixture.manager.globalCredentialPath())
 	if err != nil || string(current) != "third-party-external" {
 		t.Fatalf("external credential was overwritten: %q, %v", current, err)
 	}
@@ -2233,7 +2233,7 @@ func TestRestoreCodexAccountCredentialRejectsExternalAPIKeyReplacement(t *testin
 	if readErr != nil || string(sourceCredential) != "source-api-key" {
 		t.Fatalf("source slot overwritten: %q, err=%v", sourceCredential, readErr)
 	}
-	globalCredential, readErr := readOpaqueCredential(fixture.manager.globalCredentialPath())
+	globalCredential, readErr := readDeviceOpaqueCredential(fixture.manager.globalCredentialPath())
 	if readErr != nil || string(globalCredential) != "external-api-key" {
 		t.Fatalf("external global credential overwritten: %q, err=%v", globalCredential, readErr)
 	}
@@ -2280,7 +2280,7 @@ func TestCredentialActivationDoesNotOverwriteExternalRace(t *testing.T) {
 	if !errors.Is(err, ports.ErrCodexGlobalAccountChanged) {
 		t.Fatalf("activation error = %v, want global-account-changed", err)
 	}
-	current, readErr := readOpaqueCredential(globalPath)
+	current, readErr := readDeviceOpaqueCredential(globalPath)
 	if readErr != nil || string(current) != "external-credential" {
 		t.Fatalf("external credential was overwritten: %q, err=%v", current, readErr)
 	}
@@ -2363,7 +2363,7 @@ func TestCredentialActivationAdoptsPointerCommitReportedAsError(t *testing.T) {
 	if active.AccountID != fixture.target.Snapshot.ID || fixture.manager.activeAccountID() != fixture.target.Snapshot.ID {
 		t.Fatalf("active account = %#v, manager=%q", active, fixture.manager.activeAccountID())
 	}
-	global, readErr := readOpaqueCredential(fixture.manager.globalCredentialPath())
+	global, readErr := readDeviceOpaqueCredential(fixture.manager.globalCredentialPath())
 	if readErr != nil || string(global) != "target-api-key" {
 		t.Fatalf("target credential was rolled back after pointer commit: %q, %v", global, readErr)
 	}

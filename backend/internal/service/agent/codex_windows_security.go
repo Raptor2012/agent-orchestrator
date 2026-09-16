@@ -75,9 +75,11 @@ const codexWindowsMutationMask = codexWindowsWriteData | codexWindowsAppendData 
 const codexWindowsAncestorMutationMask = codexWindowsMutationMask &^ (codexWindowsWriteData | codexWindowsAppendData | codexWindowsWriteEA | codexWindowsWriteAttributes)
 
 type codexWindowsACE struct {
-	Allowed          bool
-	PrincipalTrusted bool
-	Mask             uint32
+	Allowed           bool
+	PrincipalTrusted  bool
+	PrincipalUnmapped bool
+	PrincipalSandbox  bool
+	Mask              uint32
 }
 
 func codexWindowsVaultACLIsSafe(ownerTrusted bool, aces []codexWindowsACE) bool {
@@ -102,4 +104,55 @@ func codexWindowsAncestorACLIsSafe(aces []codexWindowsACE) bool {
 		}
 	}
 	return true
+}
+
+// codexWindowsDeviceCredentialACLIsSafe validates Codex's device-global
+// auth.json. Unlike AO-owned vault files, Codex deliberately grants its local
+// sandbox group read access so sandboxed Codex processes can authenticate.
+// Keep that exception read-only and reject every other effective untrusted
+// allow ACE (including read-only access and principals whose names no longer
+// resolve). Windows access checks operate on SID bytes, not account names.
+func codexWindowsDeviceCredentialACLIsSafe(ownerTrusted bool, aces []codexWindowsACE) bool {
+	if !ownerTrusted {
+		return false
+	}
+	for _, ace := range aces {
+		if !ace.Allowed || ace.Mask == 0 || ace.PrincipalTrusted {
+			continue
+		}
+		if ace.PrincipalSandbox && ace.Mask&codexWindowsMutationMask == 0 {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// codexWindowsLegacyStaleSIDMask is the inherited Windows "Write,
+// ReadAndExecute, Synchronize" mask left by older Codex sandbox profiles on
+// the affected machines. An unmapped SID with only a subset of these rights
+// may be removed from a current-user-owned device credential before it is read.
+const codexWindowsLegacyStaleSIDMask uint32 = 0x001201BF
+
+func codexWindowsDeviceCredentialACLIsRepairable(ownerCurrent bool, aces []codexWindowsACE) bool {
+	if !ownerCurrent {
+		return false
+	}
+	repairNeeded := false
+	for _, ace := range aces {
+		if !ace.Allowed || ace.Mask == 0 || ace.PrincipalTrusted {
+			continue
+		}
+		if ace.PrincipalSandbox {
+			if ace.Mask&codexWindowsMutationMask != 0 {
+				return false
+			}
+			continue
+		}
+		if !ace.PrincipalUnmapped || ace.Mask&^codexWindowsLegacyStaleSIDMask != 0 {
+			return false
+		}
+		repairNeeded = true
+	}
+	return repairNeeded
 }

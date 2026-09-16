@@ -572,7 +572,7 @@ func (m *codexAccountManager) globalCredentialMissingFor(account ports.CodexAcco
 	if canonicalPath(account.Home) != m.globalHome {
 		return false
 	}
-	_, state, err := readCodexFileState(m.globalCredentialPath(), true)
+	_, state, err := readCodexDeviceFileState(m.globalCredentialPath(), true)
 	return err == nil && !state.exists
 }
 
