@@ -197,6 +197,9 @@ func (m *codexAccountManager) verifyLogin(ctx context.Context, operationID strin
 	if identityErr != nil || latestErr != nil || !sameCodexFileState(admitted, latest) || !bytes.Equal(pendingCredential, latestCredential) {
 		return m.finishLoginRetryable(operationID), nil
 	}
+	if terminalErr := m.prepareLoginTerminalForCommit(ctx, terminalHandle); terminalErr != nil {
+		return m.finishLoginRetryable(operationID), nil
+	}
 	observation := ports.CodexAccountObservation{Authentication: domain.AgentAuthenticationUnknown, Method: identity.Method}
 	exclusive, exclusiveErr := m.acquireGlobalMutation(ctx)
 	if exclusiveErr != nil {
