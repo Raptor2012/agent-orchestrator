@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,6 +13,19 @@ import (
 )
 
 const testAccountID = "72d4db6e-da2c-414c-a6a9-fdbd09a006b6"
+
+// snapshots is test-only inspection. Production callers use the catalog's
+// scoped read methods instead of materializing every account snapshot.
+func (c *codexAccountCatalog) snapshots() []domain.CodexAccountSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	records := c.sortedRecordsLocked()
+	out := make([]domain.CodexAccountSnapshot, 0, len(records))
+	for _, record := range records {
+		out = append(out, record.Snapshot)
+	}
+	return out
+}
 
 func commitTestAccount(t *testing.T, catalog *codexAccountCatalog, pendingRoot, operationID string, observed ports.CodexAccountObservation) codexAccountRecord {
 	t.Helper()
@@ -129,7 +143,7 @@ func TestCodexAccountCatalogLazilyUpgradesLegacyDescriptorIdentity(t *testing.T)
 	if err := catalog.refresh(); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.updateCredentialIdentity(record.Snapshot.ID, credential); err != nil {
+	if err := catalog.updateCredentialIdentity(context.Background(), record.Snapshot.ID, credential); err != nil {
 		t.Fatal(err)
 	}
 	upgraded, err := readCodexAccountDescriptor(descriptorPath)
@@ -303,7 +317,7 @@ func TestCodexAccountCatalogRetainsSignedOutSlotAndReplacesItsCredential(t *test
 		t.Fatalf("rediscovered account = %#v", rediscovered.Snapshot)
 	}
 
-	reauthenticated, err := catalog.replaceCredential(record.Snapshot.ID, []byte("replacement-opaque-credential"), observation)
+	reauthenticated, err := catalog.replaceCredential(context.Background(), record.Snapshot.ID, []byte("replacement-opaque-credential"), observation)
 	if err != nil {
 		t.Fatal(err)
 	}

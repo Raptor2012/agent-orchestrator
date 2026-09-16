@@ -14,20 +14,14 @@ export function mergeCodexAccounts(
 	const accounts = mode === "preserveMissing" && current
 		? [...current.accounts.filter((account) => !incoming.accounts.some((next) => next.id === account.id)), ...incoming.accounts]
 		: [...incoming.accounts];
-	const incomingPresentedActiveID = incoming.accounts.find((account) => account.active)?.id;
-	const currentPresentedActiveID = current?.accounts.find((account) => account.active)?.id;
-	const presentedActiveID = incoming.deviceReconciliation?.activeAccountVerified
+	const presentedActiveID = incoming.deviceReconciliation?.status === "verified" && incoming.deviceReconciliation.activeAccountVerified
 		? incoming.activeAccountId
-		: incoming.deviceReconciliation?.status === "checking"
-			? incomingPresentedActiveID ?? (currentPresentedActiveID === incoming.activeAccountId ? currentPresentedActiveID : undefined)
-			: undefined;
+		: undefined;
 	const normalized = accounts.map((account) => ({
 		...account,
-		// A targeted ensure performs a short local reconciliation before refreshing
-		// the expanded account. Keep the last matched row presented as active during
-		// that check; otherwise it jumps out of first place and back on every click.
-		// The daemon still routes reads through the isolated saved home until the
-		// credential match is verified, so this is presentation-only continuity.
+		// Device ownership is intentionally not preserved across an unverified
+		// reconciliation response. A stale In use badge is more misleading than the
+		// short local-check transition.
 		active: account.id === presentedActiveID,
 	}));
 	normalized.sort((left, right) => {
@@ -54,10 +48,6 @@ export function writeCodexAccounts(
  */
 export function codexAccountAuthorized(account: Pick<CodexAccount, "authentication">): boolean {
 	return account.authentication.state === "authorized" || account.authentication.state === "not_applicable";
-}
-
-export function codexAccountSignedOut(account: Pick<CodexAccount, "authentication" | "status">): boolean {
-	return account.authentication.state === "unauthorized" || account.status === "signed_out";
 }
 
 export type CodexAuthenticationDisplay = {
@@ -105,6 +95,13 @@ export function codexAuthenticationDisplay(account: Pick<CodexAccount, "authenti
 	return { key: "settings.codexAccounts.authenticationCheckFailed", action: "retry", checking: false };
 }
 
+// Switching installs an already-saved local credential. A temporary provider
+// or network failure must not make that credential unusable; only a definitive
+// signed-out state requires login first.
+export function codexAccountCanSwitch(account: Pick<CodexAccount, "status">): boolean {
+	return account.status === "valid";
+}
+
 const reasonKeys = {
 	account_valid: "settings.codexAccounts.reason.accountValid",
 	account_signed_out: "settings.codexAccounts.reason.accountSignedOut",
@@ -141,27 +138,23 @@ const reasonKeys = {
 	unsupported: "settings.codexAccounts.reason.unsupported",
 	unknown: "settings.codexAccounts.reason.unknown",
 	global_credential_store_unsupported: "settings.codexAccounts.reason.globalCredentialStoreUnsupported",
-	global_account_unverified: "settings.codexAccounts.reason.globalAccountUnverified",
-	global_account_identity_unverified: "settings.codexAccounts.reason.globalAccountIdentityUnverified",
 	global_account_changed: "settings.codexAccounts.reason.globalAccountChanged",
-	global_account_login_expired: "settings.codexAccounts.reason.globalAccountLoginExpired",
 	login_pending: "settings.codexAccounts.reason.loginPending",
 	login_completed: "settings.codexAccounts.reason.loginCompleted",
 	login_cancelled: "settings.codexAccounts.reason.loginCancelled",
 	login_failed: "settings.codexAccounts.reason.loginFailed",
 	login_unauthorized: "settings.codexAccounts.reason.loginUnauthorized",
-	login_unverified: "settings.codexAccounts.reason.loginUnverified",
 	login_expired: "settings.codexAccounts.reason.loginExpired",
 	switch_state_unavailable: "settings.codexAccounts.reason.switchStateUnavailable",
-	activation_unconfirmed: "settings.codexAccounts.reason.activationUnconfirmed",
-	rollback_unconfirmed: "settings.codexAccounts.reason.rollbackUnconfirmed",
-	daemon_restart_recovery: "settings.codexAccounts.reason.daemonRestartRecovery",
 } as const;
 
 export const codexAccountReasonCodes = Object.keys(reasonKeys) as Array<keyof typeof reasonKeys>;
 
 export type CodexAccountMessageKey = (typeof reasonKeys)[keyof typeof reasonKeys]
-	| `settings.codexAccounts.switch.${CodexAccountSwitch["phase"] | "unknown"}`;
+	| "settings.codexAccounts.switch.requested"
+	| "settings.codexAccounts.switch.completed"
+	| "settings.codexAccounts.switch.failed"
+	| "settings.codexAccounts.switch.unknown";
 
 export function codexAccountReasonKey(reasonCode: string | null | undefined): CodexAccountMessageKey {
 	return reasonKeys[reasonCode as keyof typeof reasonKeys] ?? "settings.codexAccounts.reason.unknown";
@@ -172,21 +165,15 @@ export type CodexSwitchDisplay = {
 	tone: "muted" | "warning" | "error";
 	busy: boolean;
 	mutationBlocked: boolean;
-	canRecover: boolean;
 };
 
 export function codexSwitchDisplay(switchState: CodexAccountSwitch): CodexSwitchDisplay {
 	const phase = switchState.phase;
-	const canRecover = switchState.canRecover && (phase === "rollback_required" || phase === "recovery_required");
-	const terminal = phase === "completed" || phase === "failed" || phase === "recovery_required" || (phase === "rollback_required" && canRecover);
+	const terminal = phase === "completed" || phase === "failed";
 	const busy = !terminal;
 	let key: CodexAccountMessageKey;
 	if (busy) {
-		key = phase === "rollback_required"
-			? "settings.codexAccounts.switch.rollback_required"
-			: "settings.codexAccounts.switch.requested";
-	} else if (canRecover) {
-		key = "settings.codexAccounts.switch.recovery_required";
+		key = "settings.codexAccounts.switch.requested";
 	} else if (phase === "completed") {
 		key = "settings.codexAccounts.switch.completed";
 	} else if (phase === "failed") {
@@ -196,9 +183,8 @@ export function codexSwitchDisplay(switchState: CodexAccountSwitch): CodexSwitch
 	}
 	return {
 		key,
-		tone: phase === "failed" ? "error" : phase === "rollback_required" || phase === "recovery_required" ? "warning" : "muted",
+		tone: phase === "failed" ? "error" : "muted",
 		busy,
 		mutationBlocked: phase !== "completed" && phase !== "failed",
-		canRecover,
 	};
 }

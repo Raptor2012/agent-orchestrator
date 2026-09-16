@@ -10,6 +10,11 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func protectManagedHomeForTest(t *testing.T, path string) {
+	t.Helper()
+	applyOwnerOnlyDACL(t, path)
+}
+
 // TestManagedHomePrivateOnWindows pins the Windows meaning of "private managed
 // home". os.Mkdir(path, 0o700) reports mode 0777 back through Lstat on Windows,
 // so a POSIX permission comparison can never accept a directory AO just

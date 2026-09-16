@@ -2,10 +2,7 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -63,23 +60,6 @@ func (m *codexAccountSwitchCoordinator) publishCodexAccountSwitchChanged() {
 	}
 }
 
-func codexAccountSwitchFingerprint(target string, revision int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("v3\x00%s\x00%d", target, revision)))
-	return "v3:" + hex.EncodeToString(sum[:])
-}
-
-func (m *codexAccountSwitchCoordinator) codexAccountSwitchDependencies() (ports.CodexAccountCredentialManager, ports.CodexAccountSwitchStore, error) {
-	credentials := m.credentials
-	if credentials == nil {
-		return nil, nil, errors.New("codex account credential manager is unavailable")
-	}
-	store := m.store
-	if store == nil {
-		return nil, nil, errors.New("codex account switch store is unavailable")
-	}
-	return credentials, store, nil
-}
-
 func (m *codexAccountSwitchCoordinator) acquireCodexAccountSwitchGate(ctx context.Context) error {
 	lease, err := m.codexOperationGate.AcquireExclusive(ctx)
 	if err != nil {
@@ -96,65 +76,20 @@ func (m *codexAccountSwitchCoordinator) acquireCodexAccountSwitchGate(ctx contex
 	return nil
 }
 
-// claimCodexAccountSwitchRecoveryWorker starts one recovery worker while the
-// durable global mutation fence remains active. Recovery-required operations
-// intentionally retain that fence between HTTP requests so no new Codex
-// process can start against an ambiguous runtime credential.
-func (m *codexAccountSwitchCoordinator) claimCodexAccountSwitchRecoveryWorker(ctx context.Context) bool {
-	m.codexAccountSwitchMu.Lock()
-	if m.codexAccountSwitchWorkerRunning {
-		m.codexAccountSwitchMu.Unlock()
-		return false
-	}
-	if m.codexAccountSwitchLease != nil {
-		m.codexAccountSwitchWorkerRunning = true
-		m.codexAccountSwitchMu.Unlock()
-		return true
-	}
-	m.codexAccountSwitchMu.Unlock()
-	lease, err := m.codexOperationGate.AcquireExclusive(ctx)
-	if err != nil {
-		return false
-	}
-	m.codexAccountSwitchMu.Lock()
-	defer m.codexAccountSwitchMu.Unlock()
-	if m.codexAccountSwitchWorkerRunning || m.codexAccountSwitchLease != nil {
-		lease.Release()
-		return false
-	}
-	m.codexAccountSwitchLease = lease
-	m.codexAccountSwitchWorkerRunning = true
-	return true
-}
-
-func (m *codexAccountSwitchCoordinator) finishCodexAccountSwitchWorker(keepFence bool) {
+func (m *codexAccountSwitchCoordinator) finishCodexAccountSwitchWorker() {
 	m.codexAccountSwitchMu.Lock()
 	m.codexAccountSwitchWorkerRunning = false
-	var release ports.CodexOperationLease
-	if !keepFence {
-		release = m.codexAccountSwitchLease
-		m.codexAccountSwitchLease = nil
-	}
+	release := m.codexAccountSwitchLease
+	m.codexAccountSwitchLease = nil
 	m.codexAccountSwitchMu.Unlock()
 	if release != nil {
 		release.Release()
 	}
-	if keepFence {
-		m.publishCodexAccountSwitchChanged()
-	}
 }
 
-func (m *codexAccountSwitchCoordinator) codexAccountSwitchWorkerActive() bool {
-	m.codexAccountSwitchMu.Lock()
-	defer m.codexAccountSwitchMu.Unlock()
-	return m.codexAccountSwitchWorkerRunning
-}
-
-func (m *codexAccountSwitchCoordinator) finishCodexAccountSwitchMutation(credentials ports.CodexAccountCredentialManager, keepFence bool) {
-	m.finishCodexAccountSwitchWorker(keepFence)
-	if !keepFence {
-		credentials.EndCodexAccountMutation()
-	}
+func (m *codexAccountSwitchCoordinator) finishCodexAccountSwitchMutation() {
+	m.finishCodexAccountSwitchWorker()
+	m.credentials.EndCodexAccountMutation()
 }
 
 func (m *codexAccountSwitchCoordinator) codexAccountSwitchIsActive() bool {
@@ -166,6 +101,13 @@ func (m *codexAccountSwitchCoordinator) CodexAccountSwitchInProgress() bool {
 	return m.codexAccountSwitchIsActive()
 }
 
+func (m *codexAccountSwitchCoordinator) GetCodexAccountSwitch(ctx context.Context, id string) (domain.CodexAccountSwitch, bool, error) {
+	if m.store == nil {
+		return domain.CodexAccountSwitch{}, false, errors.New("codex account switch store is unavailable")
+	}
+	return m.store.GetCodexAccountSwitch(ctx, id)
+}
+
 // StartCodexAccountSwitch admits and starts one account-service-owned global switch.
 // Existing controllers are deliberately outside this transaction: the operation
 // changes and verifies the device credential only.
@@ -175,87 +117,84 @@ func (m *codexAccountSwitchCoordinator) StartCodexAccountSwitch(ctx context.Cont
 	if cfg.IdempotencyKey == "" {
 		return domain.CodexAccountSwitch{}, errors.New("idempotency key is required")
 	}
-	credentials, store, err := m.codexAccountSwitchDependencies()
-	if err != nil {
-		return domain.CodexAccountSwitch{}, err
+	if m.credentials == nil || m.store == nil {
+		return domain.CodexAccountSwitch{}, errors.New("codex account switching is unavailable")
 	}
-	fingerprint := codexAccountSwitchFingerprint(cfg.TargetAccountID, cfg.ExpectedAccountRevision)
-	if existing, ok, readErr := store.GetCodexAccountSwitchByIdempotency(ctx, cfg.IdempotencyKey); readErr != nil {
+	if existing, ok, readErr := m.store.GetCodexAccountSwitchByIdempotency(ctx, cfg.IdempotencyKey); readErr != nil {
 		return domain.CodexAccountSwitch{}, readErr
 	} else if ok {
-		if existing.RequestFingerprint != fingerprint {
+		if existing.TargetAccountID != cfg.TargetAccountID {
 			return existing, ports.ErrCodexAccountSwitchIdempotencyConflict
 		}
-		return m.decorateCodexAccountSwitch(existing), nil
+		return existing, nil
 	}
-	if _, active, readErr := store.GetActiveCodexAccountSwitch(ctx); readErr != nil {
+	if _, active, readErr := m.store.GetActiveCodexAccountSwitch(ctx); readErr != nil {
 		return domain.CodexAccountSwitch{}, readErr
 	} else if active {
 		return domain.CodexAccountSwitch{}, ports.ErrCodexAccountSwitchInProgress
 	}
-	if err := credentials.WaitCodexAccountStoreReady(ctx); err != nil {
+	if err := m.credentials.WaitCodexAccountStoreReady(ctx); err != nil {
 		return domain.CodexAccountSwitch{}, err
 	}
-	// Device-global mutation remains fail-closed. Reconcile immediately before
-	// taking the durable switch admission fences, then revalidate again inside
-	// the activation transaction. A temporary provider failure may leave a
-	// safely observed device-only source, which is still a valid switch source.
-	_ = credentials.EnsureCodexDeviceAccountReconciled(ctx)
 	if err := m.acquireCodexAccountSwitchGate(ctx); err != nil {
 		return domain.CodexAccountSwitch{}, err
 	}
 	releaseSwitchGate := true
 	defer func() {
 		if releaseSwitchGate {
-			m.finishCodexAccountSwitchWorker(false)
+			m.finishCodexAccountSwitchWorker()
 		}
 	}()
-	if err := credentials.BeginCodexAccountMutation(ctx); err != nil {
+	if err := m.credentials.BeginCodexAccountMutation(ctx); err != nil {
 		return domain.CodexAccountSwitch{}, err
 	}
 	releaseMutation := true
 	defer func() {
 		if releaseMutation {
-			credentials.EndCodexAccountMutation()
+			m.credentials.EndCodexAccountMutation()
 		}
 	}()
-
-	source := credentials.CurrentCodexAccountSwitchSource()
-	if source.Kind == "" {
-		source.Kind = domain.CodexAccountSwitchSourceManaged
-	}
-	if source.Kind == domain.CodexAccountSwitchSourceManaged && source.AccountID == cfg.TargetAccountID {
-		return domain.CodexAccountSwitch{}, ports.ErrCodexAccountAlreadyActive
-	}
-	if source.Revision != cfg.ExpectedAccountRevision {
-		return domain.CodexAccountSwitch{}, ports.ErrCodexAccountRevisionConflict
-	}
-	if err := credentials.VerifyCodexAccountForSwitch(ctx, cfg.TargetAccountID); err != nil {
+	if err := m.credentials.CleanupInactiveCodexAccountSwitches(ctx, ""); err != nil {
 		return domain.CodexAccountSwitch{}, err
 	}
-	if credentials.CodexAccountLoginInProgress() {
-		return domain.CodexAccountSwitch{}, ports.ErrCodexAccountLoginInProgress
-	}
 
+	switchID := uuid.NewString()
+	source, err := m.credentials.PrepareCodexAccountForSwitch(ctx, switchID, cfg.TargetAccountID)
+	if err != nil {
+		return domain.CodexAccountSwitch{}, err
+	}
+	if source.Kind == domain.CodexAccountSwitchSourceManaged && source.AccountID == cfg.TargetAccountID {
+		_ = m.credentials.CleanupCodexAccountSwitch(ctx, switchID)
+		return domain.CodexAccountSwitch{}, ports.ErrCodexAccountAlreadyActive
+	}
 	now := m.clock()
 	sw := domain.CodexAccountSwitch{
-		ID: uuid.NewString(), SourceKind: source.Kind, SourceAccountID: source.AccountID,
-		TargetAccountID: cfg.TargetAccountID, Phase: domain.CodexAccountSwitchRequested,
-		IdempotencyKey: cfg.IdempotencyKey, RequestFingerprint: fingerprint,
-		ExpectedAccountRevision: cfg.ExpectedAccountRevision, CreatedAt: now, UpdatedAt: now,
+		ID: switchID, SourceKind: source.Kind, SourceAccountID: source.AccountID,
+		TargetAccountID: cfg.TargetAccountID, Phase: domain.CodexAccountSwitchActivatingAccount,
+		IdempotencyKey: cfg.IdempotencyKey,
+		CreatedAt:      now, UpdatedAt: now,
 	}
-	created, inserted, err := store.CreateCodexAccountSwitch(ctx, sw)
+	created, inserted, err := m.store.CreateCodexAccountSwitch(ctx, sw)
 	if err != nil {
+		_ = m.credentials.CleanupCodexAccountSwitch(ctx, switchID)
 		return domain.CodexAccountSwitch{}, err
 	}
 	sw = created
 	if !inserted {
-		return m.decorateCodexAccountSwitch(sw), nil
+		_ = m.credentials.CleanupCodexAccountSwitch(ctx, switchID)
+		return sw, nil
 	}
 
 	if !m.startWorker(func() {
-		m.runCodexAccountSwitch(m.backgroundContext, credentials, store, sw)
+		m.runCodexAccountSwitch(m.backgroundContext, sw)
 	}) {
+		// Shutdown raced with admission before the credential mutation worker
+		// could start. Terminally cancel this pre-mutation journal now so it does
+		// not leave a fake recovery state for the next daemon.
+		settleCtx, cancel := codexAccountSwitchDurableContext(ctx)
+		sw.FailureCode = "switch_cancelled_before_mutation"
+		m.failAndCleanupCodexAccountSwitch(settleCtx, &sw)
+		cancel()
 		return sw, context.Canceled
 	}
 	releaseMutation = false
@@ -263,14 +202,68 @@ func (m *codexAccountSwitchCoordinator) StartCodexAccountSwitch(ctx context.Cont
 	return sw, nil
 }
 
-func (m *codexAccountSwitchCoordinator) runCodexAccountSwitch(ctx context.Context, credentials ports.CodexAccountCredentialManager, store ports.CodexAccountSwitchStore, sw domain.CodexAccountSwitch) {
+func (m *codexAccountSwitchCoordinator) runCodexAccountSwitch(ctx context.Context, sw domain.CodexAccountSwitch) {
 	defer func() {
-		m.finishCodexAccountSwitchMutation(credentials, retainCodexAccountSwitchFence(sw.Phase))
+		m.finishCodexAccountSwitchMutation()
+		if sw.Phase.Terminal() {
+			// The device credential is the source of truth. Reconcile after every
+			// terminal outcome so an external login is matched or imported.
+			_ = m.credentials.EnsureCodexDeviceAccountReconciled(m.backgroundContext)
+		}
 	}()
-	m.dispatchCodexAccountSwitch(ctx, credentials, store, &sw)
+	delay := time.Second
+	for !sw.Phase.Terminal() {
+		m.dispatchCodexAccountSwitch(ctx, &sw)
+		if sw.Phase.Terminal() {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
+		current, found, err := m.store.GetCodexAccountSwitch(ctx, sw.ID)
+		if err != nil || !found {
+			continue
+		}
+		sw = current
+	}
 }
 
-func (m *codexAccountSwitchCoordinator) dispatchCodexAccountSwitch(ctx context.Context, credentials ports.CodexAccountCredentialManager, store ports.CodexAccountSwitchStore, sw *domain.CodexAccountSwitch) {
+// runCodexAccountSwitchRecovery never resumes an interrupted user request.
+// It only recognizes an already-installed target; every other local state
+// terminally cancels the old journal and lets reconciliation adopt reality.
+func (m *codexAccountSwitchCoordinator) runCodexAccountSwitchRecovery(ctx context.Context, sw domain.CodexAccountSwitch) {
+	defer func() {
+		m.finishCodexAccountSwitchMutation()
+		_ = m.credentials.EnsureCodexDeviceAccountReconciled(m.backgroundContext)
+	}()
+	delay := time.Second
+	for !sw.Phase.Terminal() {
+		if m.settleCodexAccountSwitch(ctx, &sw, "interrupted_switch_cancelled") {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
+	}
+}
+
+func (m *codexAccountSwitchCoordinator) dispatchCodexAccountSwitch(ctx context.Context, sw *domain.CodexAccountSwitch) {
 	// Switches created before source_kind was introduced are managed-account
 	// switches. Keep that compatibility at the credential coordinator boundary.
 	if sw.SourceKind == "" {
@@ -278,110 +271,90 @@ func (m *codexAccountSwitchCoordinator) dispatchCodexAccountSwitch(ctx context.C
 	}
 	for {
 		switch sw.Phase {
-		case domain.CodexAccountSwitchRequested:
-			if m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchCheckpointCredential, "") != nil {
-				return
-			}
-		case domain.CodexAccountSwitchCheckpointCredential:
-			if m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchActivatingAccount, "") != nil {
+		case domain.CodexAccountSwitchRequested, domain.CodexAccountSwitchCheckpointCredential:
+			// Compatibility only: current switches are created directly at the
+			// activating phase because both credentials are already staged.
+			if m.advanceCodexAccountSwitch(ctx, sw, domain.CodexAccountSwitchActivatingAccount, "") != nil {
 				return
 			}
 		case domain.CodexAccountSwitchActivatingAccount:
-			active := credentials.CurrentCodexActiveAccount()
-			if active.AccountID != sw.TargetAccountID {
-				if active.Revision != sw.ExpectedAccountRevision ||
-					(sw.SourceKind == domain.CodexAccountSwitchSourceManaged && active.AccountID != sw.SourceAccountID) {
-					_ = m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchRecoveryRequired, "activation_unconfirmed")
-					return
-				}
-				if _, err := credentials.CheckpointAndActivateCodexAccount(
-					ctx, sw.SourceKind, sw.ID, sw.TargetAccountID, sw.ExpectedAccountRevision,
-				); err != nil {
-					if m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchRollbackRequired, "activation_unconfirmed") != nil {
+			state, inspectErr := m.credentials.InspectCodexAccountSwitch(ctx, sw.ID, sw.SourceKind, sw.SourceAccountID, sw.TargetAccountID)
+			if inspectErr != nil {
+				return
+			}
+			if state != domain.CodexAccountSwitchTargetInstalled {
+				if err := m.credentials.ActivatePreparedCodexAccountSwitch(ctx, sw.SourceKind, sw.ID, sw.TargetAccountID); err != nil {
+					if errors.Is(err, ports.ErrCodexAccountSwitchNotCommitted) {
+						sw.FailureCode = "activation_failed"
+						m.failAndCleanupCodexAccountSwitch(ctx, sw)
 						return
 					}
-					continue
+					m.settleCodexAccountSwitch(ctx, sw, "activation_failed")
+					return
 				}
 			}
 			committedAt := m.clock()
 			sw.CredentialsCommittedAt = &committedAt
-			if m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchVerifyingAccount, "") != nil {
-				return
-			}
-		case domain.CodexAccountSwitchVerifyingAccount:
-			if err := credentials.VerifyCurrentCodexAccount(ctx, sw.TargetAccountID); err != nil {
-				_ = m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchRecoveryRequired, "target_verification_unconfirmed")
-				return
-			}
-			if sw.CredentialsCommittedAt == nil {
-				committedAt := m.clock()
-				sw.CredentialsCommittedAt = &committedAt
-			}
-			m.completeCodexAccountSwitch(ctx, credentials, store, sw)
-			return
-		case domain.CodexAccountSwitchRollbackRequired:
-			if err := credentials.RestoreCodexAccountCredential(
-				ctx, sw.ID, sw.SourceKind, sw.SourceAccountID, sw.TargetAccountID,
-			); err != nil {
-				_ = m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchRecoveryRequired, "rollback_unconfirmed")
-				return
-			}
-			if sw.SourceKind == domain.CodexAccountSwitchSourceManaged {
-				if err := credentials.VerifyCurrentCodexAccount(ctx, sw.SourceAccountID); err != nil {
-					_ = m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchRecoveryRequired, "rollback_unconfirmed")
-					return
-				}
-			}
-			m.failAndCleanupCodexAccountSwitch(ctx, credentials, store, sw)
+			m.completeCodexAccountSwitch(ctx, sw)
 			return
 		case domain.CodexAccountSwitchRecoveryRequired:
-			// Device credential truth decides ambiguous activation recovery.
-			if err := credentials.VerifyCurrentCodexAccount(ctx, sw.TargetAccountID); err == nil {
-				if sw.CredentialsCommittedAt == nil {
-					committedAt := m.clock()
-					sw.CredentialsCommittedAt = &committedAt
-				}
-				m.completeCodexAccountSwitch(ctx, credentials, store, sw)
-				return
-			}
-			if m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchRollbackRequired, sw.FailureCode) != nil {
-				return
-			}
+			// Compatibility for a switch journal written by an older build. There
+			// is no user-driven recovery anymore: settle it from the current local
+			// credential, then let normal reconciliation adopt that credential.
+			m.settleCodexAccountSwitch(ctx, sw, "legacy_switch_interrupted")
+			return
 		case domain.CodexAccountSwitchCompleted, domain.CodexAccountSwitchFailed:
 			return
 		default:
-			_ = m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchRecoveryRequired, "switch_state_unavailable")
+			sw.FailureCode = "switch_state_unavailable"
+			m.failAndCleanupCodexAccountSwitch(ctx, sw)
 			return
 		}
 	}
 }
 
-func (m *codexAccountSwitchCoordinator) completeCodexAccountSwitch(ctx context.Context, credentials ports.CodexAccountCredentialManager, store ports.CodexAccountSwitchStore, sw *domain.CodexAccountSwitch) {
+// settleCodexAccountSwitch resolves an interrupted operation from local state.
+// If the target is installed, the switch completes. Otherwise the switch ends
+// and ordinary reconciliation adopts whatever credential the device now has.
+func (m *codexAccountSwitchCoordinator) settleCodexAccountSwitch(ctx context.Context, sw *domain.CodexAccountSwitch, failureCode string) bool {
+	state, err := m.credentials.InspectCodexAccountSwitch(ctx, sw.ID, sw.SourceKind, sw.SourceAccountID, sw.TargetAccountID)
+	if err != nil {
+		return false
+	}
+	if state == domain.CodexAccountSwitchTargetInstalled {
+		if sw.CredentialsCommittedAt == nil {
+			committedAt := m.clock()
+			sw.CredentialsCommittedAt = &committedAt
+		}
+		m.completeCodexAccountSwitch(ctx, sw)
+		return true
+	}
+	sw.FailureCode = failureCode
+	m.failAndCleanupCodexAccountSwitch(ctx, sw)
+	return true
+}
+
+func (m *codexAccountSwitchCoordinator) completeCodexAccountSwitch(ctx context.Context, sw *domain.CodexAccountSwitch) {
 	completed := m.clock()
 	sw.CompletedAt = &completed
-	if m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchCompleted, "") == nil {
-		_ = credentials.CleanupCodexAccountSwitch(ctx, sw.ID)
+	if m.advanceCodexAccountSwitch(ctx, sw, domain.CodexAccountSwitchCompleted, "") == nil {
+		_ = m.credentials.CleanupCodexAccountSwitch(ctx, sw.ID)
 	}
 }
 
-func (m *codexAccountSwitchCoordinator) failAndCleanupCodexAccountSwitch(ctx context.Context, credentials ports.CodexAccountCredentialManager, store ports.CodexAccountSwitchStore, sw *domain.CodexAccountSwitch) {
+func (m *codexAccountSwitchCoordinator) failAndCleanupCodexAccountSwitch(ctx context.Context, sw *domain.CodexAccountSwitch) {
 	completed := m.clock()
 	sw.CompletedAt = &completed
-	if m.advanceCodexAccountSwitch(ctx, store, sw, domain.CodexAccountSwitchFailed, sw.FailureCode) == nil {
-		_ = credentials.CleanupCodexAccountSwitch(ctx, sw.ID)
+	if m.advanceCodexAccountSwitch(ctx, sw, domain.CodexAccountSwitchFailed, sw.FailureCode) == nil {
+		_ = m.credentials.CleanupCodexAccountSwitch(ctx, sw.ID)
 	}
 }
 
-func retainCodexAccountSwitchFence(phase domain.CodexAccountSwitchPhase) bool {
-	return !phase.Terminal()
-}
-
-func (m *codexAccountSwitchCoordinator) advanceCodexAccountSwitch(ctx context.Context, store ports.CodexAccountSwitchStore, sw *domain.CodexAccountSwitch, next domain.CodexAccountSwitchPhase, code string) error {
+func (m *codexAccountSwitchCoordinator) advanceCodexAccountSwitch(ctx context.Context, sw *domain.CodexAccountSwitch, next domain.CodexAccountSwitchPhase, code string) error {
 	expected := sw.Phase
 	candidate := *sw
 	candidate.Phase, candidate.FailureCode, candidate.UpdatedAt = next, code, m.clock()
-	candidate.CanRecover = next == domain.CodexAccountSwitchRecoveryRequired
-	ok, err := store.UpdateCodexAccountSwitch(ctx, candidate, expected)
+	ok, err := m.store.UpdateCodexAccountSwitch(ctx, candidate, expected)
 	if err == nil && ok {
 		*sw = candidate
 		m.publishCodexAccountSwitchChanged()
@@ -389,13 +362,12 @@ func (m *codexAccountSwitchCoordinator) advanceCodexAccountSwitch(ctx context.Co
 	}
 	settleCtx, cancel := codexAccountSwitchDurableContext(ctx)
 	defer cancel()
-	current, found, readErr := store.GetCodexAccountSwitch(settleCtx, sw.ID)
+	current, found, readErr := m.store.GetCodexAccountSwitch(settleCtx, sw.ID)
 	if readErr != nil {
 		return errors.Join(err, readErr)
 	}
 	if found && current.Phase == candidate.Phase && current.FailureCode == candidate.FailureCode {
 		*sw = current
-		sw.CanRecover = false
 		return nil
 	}
 	if found {
@@ -407,100 +379,104 @@ func (m *codexAccountSwitchCoordinator) advanceCodexAccountSwitch(ctx context.Co
 	return errors.New("codex account switch changed concurrently")
 }
 
-func (m *codexAccountSwitchCoordinator) decorateCodexAccountSwitch(sw domain.CodexAccountSwitch) domain.CodexAccountSwitch {
-	sw.CanRecover = !sw.Phase.Terminal() && !m.codexAccountSwitchWorkerActive()
-	return sw
-}
-
-func (m *codexAccountSwitchCoordinator) getCodexAccountSwitch(ctx context.Context, id string) (domain.CodexAccountSwitch, error) {
-	_, store, err := m.codexAccountSwitchDependencies()
-	if err != nil {
-		return domain.CodexAccountSwitch{}, err
-	}
-	sw, ok, err := store.GetCodexAccountSwitch(ctx, strings.TrimSpace(id))
-	if err != nil {
-		return sw, err
-	}
-	if !ok {
-		return sw, ports.ErrCodexAccountSwitchNotFound
-	}
-	return m.decorateCodexAccountSwitch(sw), nil
-}
-
 // GetActiveCodexAccountSwitch returns the sole nonterminal switch when present.
 func (m *codexAccountSwitchCoordinator) GetActiveCodexAccountSwitch(ctx context.Context) (domain.CodexAccountSwitch, bool, error) {
-	_, store, err := m.codexAccountSwitchDependencies()
-	if err != nil {
-		return domain.CodexAccountSwitch{}, false, err
+	if m.store == nil {
+		return domain.CodexAccountSwitch{}, false, errors.New("codex account switch store is unavailable")
 	}
-	sw, ok, err := store.GetActiveCodexAccountSwitch(ctx)
+	sw, ok, err := m.store.GetActiveCodexAccountSwitch(ctx)
 	if err != nil || !ok {
 		return sw, ok, err
 	}
-	return m.decorateCodexAccountSwitch(sw), true, nil
+	return sw, true, nil
 }
 
-// RecoverCodexAccountSwitch retries the exact incomplete credential operation.
-func (m *codexAccountSwitchCoordinator) RecoverCodexAccountSwitch(ctx context.Context, id string) (domain.CodexAccountSwitch, error) {
-	credentials, store, err := m.codexAccountSwitchDependencies()
-	if err != nil {
-		return domain.CodexAccountSwitch{}, err
-	}
-	sw, err := m.getCodexAccountSwitch(ctx, id)
-	if err != nil {
-		return sw, err
-	}
-	if sw.Phase.Terminal() {
-		return sw, errors.New("codex account switch is already terminal")
-	}
-	if !m.claimCodexAccountSwitchRecoveryWorker(ctx) {
-		return sw, ports.ErrCodexAccountSwitchInProgress
-	}
-	if !m.startWorker(func() {
-		m.recoverCodexAccountSwitch(m.backgroundContext, credentials, store, sw)
-	}) {
-		m.finishCodexAccountSwitchWorker(false)
-		return sw, context.Canceled
-	}
-	return sw, nil
-}
-
-func (m *codexAccountSwitchCoordinator) recoverCodexAccountSwitch(ctx context.Context, credentials ports.CodexAccountCredentialManager, store ports.CodexAccountSwitchStore, sw domain.CodexAccountSwitch) {
-	defer func() {
-		m.finishCodexAccountSwitchMutation(credentials, retainCodexAccountSwitchFence(sw.Phase))
-	}()
-	m.dispatchCodexAccountSwitch(ctx, credentials, store, &sw)
-}
-
-// ReconcileCodexAccountSwitches restores the device-global credential fence
-// before any new Codex process is admitted, then resumes the durable operation.
+// ReconcileCodexAccountSwitches starts the best-effort recovery supervisor.
+// Account-switch recovery must never prevent the rest of the daemon starting.
 func (m *codexAccountSwitchCoordinator) ReconcileCodexAccountSwitches(ctx context.Context) error {
-	credentials, store, err := m.codexAccountSwitchDependencies()
-	if err != nil {
+	if m.credentials == nil || m.store == nil {
 		return nil //nolint:nilerr // account switching is optional when its feature wiring is absent.
 	}
-	sw, ok, err := store.GetActiveCodexAccountSwitch(ctx)
-	if err != nil || !ok {
-		return err
-	}
-	if err := credentials.WaitCodexAccountStoreReady(ctx); err != nil {
-		return err
-	}
+	// Publish the Codex launch/mutation fence before the first fallible journal
+	// read. A crashed switch may already have crossed the credential mutation
+	// boundary even when SQLite is temporarily unavailable.
 	if err := m.acquireCodexAccountSwitchGate(ctx); err != nil {
 		return err
 	}
-	if err := credentials.BeginCodexAccountMutation(ctx); err != nil {
-		m.finishCodexAccountSwitchWorker(false)
+	sw, ok, err := m.store.GetActiveCodexAccountSwitch(ctx)
+	if err != nil {
+		m.startCodexAccountSwitchRecoveryRetryWithHeldGate()
+		return err
+	}
+	if !ok {
+		cleanupErr := m.credentials.CleanupInactiveCodexAccountSwitches(ctx, "")
+		m.finishCodexAccountSwitchWorker()
+		return cleanupErr
+	}
+	if err := m.startCodexAccountSwitchRecoveryWithHeldGate(ctx, sw); err != nil {
+		m.startCodexAccountSwitchRecoveryRetryWithHeldGate()
+		return err
+	}
+	return nil
+}
+
+func (m *codexAccountSwitchCoordinator) startCodexAccountSwitchRecoveryWithHeldGate(ctx context.Context, sw domain.CodexAccountSwitch) error {
+	if err := m.credentials.WaitCodexAccountStoreReady(ctx); err != nil {
+		return err
+	}
+	if err := m.credentials.BeginCodexAccountMutation(ctx); err != nil {
+		return err
+	}
+	if err := m.credentials.CleanupInactiveCodexAccountSwitches(ctx, sw.ID); err != nil {
+		m.credentials.EndCodexAccountMutation()
 		return err
 	}
 	if !m.startWorker(func() {
-		m.runCodexAccountSwitch(m.backgroundContext, credentials, store, sw)
+		m.runCodexAccountSwitchRecovery(m.backgroundContext, sw)
 	}) {
-		credentials.EndCodexAccountMutation()
-		m.finishCodexAccountSwitchWorker(false)
+		m.credentials.EndCodexAccountMutation()
 		return context.Canceled
 	}
 	return nil
+}
+
+func (m *codexAccountSwitchCoordinator) startCodexAccountSwitchRecoveryRetryWithHeldGate() {
+	if !m.startWorker(func() {
+		defer func() {
+			if m.backgroundContext.Err() != nil {
+				m.finishCodexAccountSwitchWorker()
+			}
+		}()
+		delay := time.Second
+		for {
+			select {
+			case <-m.backgroundContext.Done():
+				return
+			case <-time.After(delay):
+			}
+			sw, ok, err := m.store.GetActiveCodexAccountSwitch(m.backgroundContext)
+			if err != nil {
+				if delay < 30*time.Second {
+					delay *= 2
+					if delay > 30*time.Second {
+						delay = 30 * time.Second
+					}
+				}
+				continue
+			}
+			if !ok {
+				_ = m.credentials.CleanupInactiveCodexAccountSwitches(m.backgroundContext, "")
+				m.finishCodexAccountSwitchWorker()
+				return
+			}
+			if err := m.startCodexAccountSwitchRecoveryWithHeldGate(m.backgroundContext, sw); err != nil {
+				continue
+			}
+			return
+		}
+	}) {
+		m.finishCodexAccountSwitchWorker()
+	}
 }
 
 func (m *codexAccountSwitchCoordinator) startWorker(run func()) bool {

@@ -413,9 +413,9 @@ paths:
       summary: Start a global AO Codex account switch
       tags:
       - agents
-  /api/v1/agents/codex/account-switches/{switchId}/recover:
-    post:
-      operationId: recoverCodexAccountSwitch
+  /api/v1/agents/codex/account-switches/{switchId}:
+    get:
+      operationId: getCodexAccountSwitch
       parameters:
       - description: Durable Codex account switch identifier.
         in: path
@@ -437,13 +437,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Not Found
-        "409":
+        "501":
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/APIError'
-          description: Conflict
-      summary: Retry recovery for one Codex account switch
+          description: Not Implemented
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Read one durable Codex account switch
       tags:
       - agents
   /api/v1/agents/codex/accounts:
@@ -655,38 +661,6 @@ paths:
                 $ref: '#/components/schemas/APIError'
           description: Service Unavailable
       summary: Consume one provider-reported Codex usage-limit reset credit
-      tags:
-      - agents
-  /api/v1/agents/codex/accounts/device/login-terminal:
-    post:
-      operationId: openCodexDeviceAccountLoginTerminal
-      responses:
-        "202":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OpenCodexAccountLoginTerminalResponse'
-          description: Accepted
-        "409":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/APIError'
-          description: Conflict
-        "501":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/APIError'
-          description: Not Implemented
-        "503":
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/APIError'
-          description: Service Unavailable
-      summary: Open an isolated native login that replaces the device Codex account
-        after verification
       tags:
       - agents
   /api/v1/agents/codex/accounts/ensure:
@@ -7194,6 +7168,8 @@ components:
       type: object
     AgentConfig:
       properties:
+        effort:
+          type: string
         mode:
           type: string
         model:
@@ -7344,6 +7320,12 @@ components:
       type: object
     AgentModelInfo:
       properties:
+        defaultEffort:
+          type: string
+        efforts:
+          items:
+            type: string
+          type: array
         id:
           type: string
         isDefault:
@@ -7814,7 +7796,7 @@ components:
           - pending
           - verifying
           - unauthorized
-          - unverified
+          - retryable
           - completed
           - cancelled
           - failed
@@ -7893,8 +7875,6 @@ components:
       type: object
     CodexAccountSwitchResponse:
       properties:
-        canRecover:
-          type: boolean
         completedAt:
           format: date-time
           type:
@@ -7917,8 +7897,6 @@ components:
           - requested
           - checkpointing_source
           - activating_target
-          - verifying_target
-          - rollback_required
           - recovery_required
           - completed
           - failed
@@ -7941,7 +7919,6 @@ components:
       - sourceKind
       - targetAccountId
       - phase
-      - canRecover
       - createdAt
       - updatedAt
       type: object
@@ -8000,8 +7977,6 @@ components:
           $ref: '#/components/schemas/CodexAccountSwitchResponse'
         deviceReconciliation:
           $ref: '#/components/schemas/CodexDeviceReconciliationResponse'
-        unmanagedGlobalAccount:
-          $ref: '#/components/schemas/CodexUnmanagedGlobalAccountResponse'
       required:
       - accountRevision
       - accounts
@@ -8028,7 +8003,7 @@ components:
           - pending
           - verifying
           - unauthorized
-          - unverified
+          - retryable
           - completed
           - cancelled
           - failed
@@ -8184,34 +8159,6 @@ components:
           - string
       required:
       - availableCount
-      type: object
-    CodexUnmanagedGlobalAccountResponse:
-      properties:
-        accountEmail:
-          type:
-          - "null"
-          - string
-        authMethod:
-          enum:
-          - chatgpt
-          - api_key
-          - other
-          - unknown
-          type: string
-        authentication:
-          $ref: '#/components/schemas/CodexAuthenticationResponse'
-        label:
-          type: string
-        reason:
-          type: string
-        reasonCode:
-          type: string
-      required:
-      - label
-      - authMethod
-      - authentication
-      - reasonCode
-      - reason
       type: object
     CompactConversationResponse:
       properties:
@@ -9237,6 +9184,11 @@ components:
         brief:
           maxLength: 16384
           type: string
+        effort:
+          maxLength: 64
+          type:
+          - "null"
+          - string
         mode:
           enum:
           - tui
@@ -11410,6 +11362,11 @@ components:
         launchId:
           description: AO process generation that produced the signal.
           type: string
+        observedAt:
+          description: Time the local hook process observed the event, before delivery
+            to the daemon.
+          format: date-time
+          type: string
         providerTurnId:
           description: Native main-turn identity reported by the hook, when supported.
           type: string
@@ -11770,6 +11727,8 @@ components:
         model:
           maxLength: 256
           type: string
+        parentSessionId:
+          type: string
         projectId:
           type: string
         prompt:
@@ -11848,9 +11807,11 @@ components:
     StartCodexAccountSwitchRequest:
       properties:
         expectedAccountRevision:
-          format: int64
+          deprecated: true
           minimum: 0
-          type: integer
+          type:
+          - "null"
+          - integer
         idempotencyKey:
           minLength: 1
           type: string
@@ -11859,7 +11820,6 @@ components:
           type: string
       required:
       - targetAccountId
-      - expectedAccountRevision
       - idempotencyKey
       type: object
     StartPreviewServerRequest:

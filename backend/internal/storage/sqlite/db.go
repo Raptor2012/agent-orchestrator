@@ -194,6 +194,101 @@ func OpenReadOnly(ctx context.Context, dataDir string) (*Store, error) {
 // touch goose.
 var gooseMu sync.Mutex
 
+// cachedMigrationVersion holds the one-time computed expected migration version.
+// The first call to expectedMigrationVersion populates it; subsequent calls
+// return the cached value without re-scanning embedded files or touching goose
+// globals.
+var cachedMigrationVersion struct {
+	sync.Once
+	version int64
+	err     error
+}
+
+// expectedMigrationVersion returns the highest version number among the
+// embedded migration files. This is the version a fully-migrated database must
+// have recorded as applied in goose_db_version.
+//
+// The result is computed once and cached for the lifetime of the process.
+func expectedMigrationVersion() (int64, error) {
+	cachedMigrationVersion.Do(func() {
+		cachedMigrationVersion.err = computeExpectedMigrationVersion()
+	})
+	return cachedMigrationVersion.version, cachedMigrationVersion.err
+}
+
+func computeExpectedMigrationVersion() error {
+	gooseMu.Lock()
+	defer gooseMu.Unlock()
+	goose.SetBaseFS(migrationsFS)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		return fmt.Errorf("set goose dialect: %w", err)
+	}
+	migrations, err := goose.CollectMigrations("migrations", 0, goose.MaxVersion)
+	if err != nil {
+		return fmt.Errorf("collect migrations: %w", err)
+	}
+	if len(migrations) == 0 {
+		return fmt.Errorf("no embedded migrations found")
+	}
+	cachedMigrationVersion.version = migrations[len(migrations)-1].Version
+	return nil
+}
+
+// OpenPreMigrated opens an already-fully-migrated SQLite database under
+// dataDir, skipping all migration and repair logic. It is intended for test
+// helpers that clone a known-good template database and need to open the copy
+// without paying the ~55 ms migration overhead on every clone.
+//
+// It verifies that the database's goose_db_version records the expected
+// current migration version; if the database is stale or has never been
+// migrated, it returns an error so the caller can fall back to the production
+// Open path rather than silently using an incompatible schema.
+//
+// Migration tests and any code that needs the production startup path must
+// continue to call Open, not this function.
+func OpenPreMigrated(dataDir string) (*Store, error) {
+	want, err := expectedMigrationVersion()
+	if err != nil {
+		return nil, fmt.Errorf("determine expected migration version: %w", err)
+	}
+
+	dsn := databaseURI(dataDir) + pragmas
+
+	writeDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite writer: %w", err)
+	}
+	writeDB.SetMaxOpenConns(1)
+	writeDB.SetMaxIdleConns(1)
+
+	var got int64
+	if err := writeDB.QueryRow(
+		`SELECT COALESCE(MAX(version_id), 0) FROM goose_db_version WHERE is_applied = 1`,
+	).Scan(&got); err != nil {
+		_ = writeDB.Close()
+		return nil, fmt.Errorf("read applied migration version: %w", err)
+	}
+	if got != want {
+		_ = writeDB.Close()
+		return nil, fmt.Errorf(
+			"database schema version mismatch: database has version %d but binary expects %d; "+
+				"the template is stale — rebuild it with a full sqlite.Open call",
+			got, want,
+		)
+	}
+
+	readDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		_ = writeDB.Close()
+		return nil, fmt.Errorf("open sqlite reader: %w", err)
+	}
+	readDB.SetMaxOpenConns(maxReaders)
+	readDB.SetMaxIdleConns(maxReaders)
+
+	return sqlitestore.NewStore(writeDB, readDB), nil
+}
+
 func migrate(db *sql.DB) error {
 	gooseMu.Lock()
 	defer gooseMu.Unlock()
@@ -234,9 +329,6 @@ func migrate(db *sql.DB) error {
 	}
 	if err := repairRenumberedPRReviewPartialMigrationHistory(db); err != nil {
 		return fmt.Errorf("repair renumbered PR review-partial migration history: %w", err)
-	}
-	if err := repairRenumberedCodexAccountSwitchMigrationHistory(db); err != nil {
-		return fmt.Errorf("repair renumbered Codex account-switch migration history: %w", err)
 	}
 	if err := prepareBurnedSchemaRepairs(db); err != nil {
 		return fmt.Errorf("prepare burned schema repairs: %w", err)
@@ -1436,145 +1528,6 @@ SELECT COALESCE((
 	if _, err := tx.Exec(`UPDATE pr SET review_partial = TRUE`); err != nil {
 		return err
 	}
-	return tx.Commit()
-}
-
-// repairRenumberedCodexAccountSwitchMigrationHistory preserves development
-// databases opened while the account-switch branches owned versions 0129/0130
-// or 0140-0142. Main later assigned those versions to other migrations.
-// Physical schema identifies the old branch migrations: remap their effects
-// to 0146-0148 and release any collided main
-// version whose physical effect is still absent so Goose can apply it.
-func repairRenumberedCodexAccountSwitchMigrationHistory(db *sql.DB) error {
-	var gooseTable int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'goose_db_version'`,
-	).Scan(&gooseTable); err != nil {
-		return err
-	}
-	if gooseTable == 0 {
-		return nil
-	}
-	var cleanupApplied int
-	if err := db.QueryRow(`
-SELECT COALESCE((
-    SELECT is_applied FROM goose_db_version
-    WHERE version_id = 148 ORDER BY id DESC LIMIT 1
-), 0)`).Scan(&cleanupApplied); err != nil {
-		return err
-	}
-	if cleanupApplied != 0 {
-		return nil
-	}
-
-	var restartColumn, sourceKindColumn int
-	if err := db.QueryRow(`
-SELECT (SELECT COUNT(*) FROM pragma_table_info('codex_account_switches') WHERE name = 'restart_running_sessions'),
-       (SELECT COUNT(*) FROM pragma_table_info('codex_account_switches') WHERE name = 'source_kind')`,
-	).Scan(&restartColumn, &sourceKindColumn); err != nil {
-		return err
-	}
-	if restartColumn == 0 && sourceKindColumn == 0 {
-		return nil
-	}
-	var legacySessionTable int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'codex_account_switch_sessions'`).Scan(&legacySessionTable); err != nil {
-		return err
-	}
-	cleanedUp := sourceKindColumn != 0 && restartColumn == 0 && legacySessionTable == 0
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	latestApplied := func(version int64) (int, error) {
-		var applied int
-		err := tx.QueryRow(`
-SELECT COALESCE((
-    SELECT is_applied FROM goose_db_version
-    WHERE version_id = ? ORDER BY id DESC LIMIT 1
-), 0)`, version).Scan(&applied)
-		return applied, err
-	}
-	markApplied := func(version int64) error {
-		applied, err := latestApplied(version)
-		if err != nil || applied != 0 {
-			return err
-		}
-		_, err = tx.Exec(`INSERT INTO goose_db_version (version_id, is_applied) VALUES (?, 1)`, version)
-		return err
-	}
-
-	if restartColumn != 0 || cleanedUp {
-		var retentionIndex int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_change_log_created_at_seq'`,
-		).Scan(&retentionIndex); err != nil {
-			return err
-		}
-		applied129, err := latestApplied(129)
-		if err != nil {
-			return err
-		}
-		if applied129 != 0 && retentionIndex == 0 {
-			if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = 129`); err != nil {
-				return err
-			}
-		}
-		if err := markApplied(146); err != nil {
-			return err
-		}
-	}
-
-	if sourceKindColumn != 0 {
-		var reviewPartialColumn int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM pragma_table_info('pr') WHERE name = 'review_partial'`,
-		).Scan(&reviewPartialColumn); err != nil {
-			return err
-		}
-		applied130, err := latestApplied(130)
-		if err != nil {
-			return err
-		}
-		if applied130 != 0 && reviewPartialColumn == 0 {
-			if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = 130`); err != nil {
-				return err
-			}
-		}
-		if err := markApplied(147); err != nil {
-			return err
-		}
-	}
-	if cleanedUp {
-		if err := markApplied(148); err != nil {
-			return err
-		}
-	}
-	// The second branch numbering collided with standalone sessions and
-	// checkpoint provenance. Only release a version when its main schema is
-	// absent; already-applied main migrations must not run their ALTERs twice.
-	for _, repair := range []struct {
-		version int64
-		query   string
-	}{
-		{140, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'project_id' AND "notnull" = 0`},
-		{141, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'conversation_checkpoint_state'`},
-		{142, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'conversation_checkpoint_unsettled'`},
-	} {
-		var present int
-		if err := tx.QueryRow(repair.query).Scan(&present); err != nil {
-			return err
-		}
-		if present == 0 {
-			if _, err := tx.Exec(`DELETE FROM goose_db_version WHERE version_id = ?`, repair.version); err != nil {
-				return err
-			}
-		}
-	}
-
 	return tx.Commit()
 }
 

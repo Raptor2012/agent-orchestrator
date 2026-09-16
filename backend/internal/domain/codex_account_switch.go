@@ -20,8 +20,19 @@ const (
 type CodexAccountSwitchSource struct {
 	Kind      CodexAccountSwitchSourceKind
 	AccountID string
-	Revision  int64
 }
+
+// CodexAccountSwitchInstallationState is the conclusively observed local
+// device state used to settle an interrupted credential switch.
+type CodexAccountSwitchInstallationState string
+
+// Local Codex account switch installation states.
+const (
+	CodexAccountSwitchTargetInstalled    CodexAccountSwitchInstallationState = "target"
+	CodexAccountSwitchSourceInstalled    CodexAccountSwitchInstallationState = "source"
+	CodexAccountSwitchCredentialMissing  CodexAccountSwitchInstallationState = "missing"
+	CodexAccountSwitchExternalCredential CodexAccountSwitchInstallationState = "external"
+)
 
 // CodexAccountSwitchPhase is the durable global credential-switch phase.
 type CodexAccountSwitchPhase string
@@ -33,11 +44,8 @@ const (
 	CodexAccountSwitchCheckpointCredential CodexAccountSwitchPhase = "checkpointing_source"
 	// CodexAccountSwitchActivatingAccount stages the selected target credential.
 	CodexAccountSwitchActivatingAccount CodexAccountSwitchPhase = "activating_target"
-	// CodexAccountSwitchVerifyingAccount verifies the device-global identity.
-	CodexAccountSwitchVerifyingAccount CodexAccountSwitchPhase = "verifying_target"
-	// CodexAccountSwitchRollbackRequired requires restoring the source credential.
-	CodexAccountSwitchRollbackRequired CodexAccountSwitchPhase = "rollback_required"
-	// CodexAccountSwitchRecoveryRequired requires exact recorded recovery work.
+	// CodexAccountSwitchRecoveryRequired is retained only to settle journals
+	// written by older builds. New switches never enter this phase.
 	CodexAccountSwitchRecoveryRequired CodexAccountSwitchPhase = "recovery_required"
 	// CodexAccountSwitchCompleted means target activation succeeded.
 	CodexAccountSwitchCompleted CodexAccountSwitchPhase = "completed"
@@ -58,13 +66,10 @@ type CodexAccountSwitch struct {
 	TargetAccountID        string                       `json:"targetAccountId"`
 	Phase                  CodexAccountSwitchPhase      `json:"phase"`
 	FailureCode            string                       `json:"failureCode,omitempty"`
-	CanRecover             bool                         `json:"canRecover"`
 	CredentialsCommittedAt *time.Time                   `json:"credentialsCommittedAt,omitempty"`
 	CreatedAt              time.Time                    `json:"createdAt"`
 	UpdatedAt              time.Time                    `json:"updatedAt"`
 	CompletedAt            *time.Time                   `json:"completedAt,omitempty"`
 	// Daemon-private idempotency data.
-	IdempotencyKey          string `json:"-"`
-	RequestFingerprint      string `json:"-"`
-	ExpectedAccountRevision int64  `json:"-"`
+	IdempotencyKey string `json:"-"`
 }

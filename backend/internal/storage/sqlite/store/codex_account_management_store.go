@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -13,66 +12,6 @@ import (
 )
 
 var _ ports.CodexAccountSwitchStore = (*Store)(nil)
-
-// GetCodexActiveAccount reads the singleton active-account pointer.
-func (s *Store) GetCodexActiveAccount(ctx context.Context) (domain.CodexActiveAccount, bool, error) {
-	row, err := s.qr.GetCodexActiveAccount(ctx)
-	if errors.Is(err, sql.ErrNoRows) {
-		return domain.CodexActiveAccount{}, false, nil
-	}
-	if err != nil {
-		return domain.CodexActiveAccount{}, false, fmt.Errorf("get active Codex account: %w", err)
-	}
-	return domain.CodexActiveAccount{
-		AccountID: row.AccountID, Revision: row.Revision,
-		ActivatedAt: row.ActivatedAt, UpdatedAt: row.UpdatedAt,
-	}, true, nil
-}
-
-// SetCodexActiveAccount atomically advances the active-account revision.
-func (s *Store) SetCodexActiveAccount(ctx context.Context, accountID string, expectedRevision int64, at time.Time) (domain.CodexActiveAccount, error) {
-	if expectedRevision < 0 || (accountID == "" && expectedRevision == 0) {
-		return domain.CodexActiveAccount{}, ports.ErrCodexAccountRevisionConflict
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	var active domain.CodexActiveAccount
-	err := s.inTx(ctx, "set active Codex account", func(q *gen.Queries) error {
-		var (
-			changed int64
-			err     error
-		)
-		if expectedRevision == 0 {
-			changed, err = q.InsertCodexActiveAccount(ctx, gen.InsertCodexActiveAccountParams{
-				AccountID: accountID, ActivatedAt: at.UTC(), UpdatedAt: at.UTC(),
-			})
-		} else {
-			changed, err = q.UpdateCodexActiveAccount(ctx, gen.UpdateCodexActiveAccountParams{
-				AccountID: accountID, ActivatedAt: at.UTC(), UpdatedAt: at.UTC(), ExpectedRevision: expectedRevision,
-			})
-		}
-		if err != nil {
-			return err
-		}
-		if changed == 0 {
-			return ports.ErrCodexAccountRevisionConflict
-		}
-		row, err := q.GetCodexActiveAccount(ctx)
-		if err != nil {
-			return fmt.Errorf("read activated Codex account: %w", err)
-		}
-		active = domain.CodexActiveAccount{
-			AccountID: row.AccountID, Revision: row.Revision,
-			ActivatedAt: row.ActivatedAt, UpdatedAt: row.UpdatedAt,
-		}
-		return nil
-	})
-	if err != nil {
-		return domain.CodexActiveAccount{}, err
-	}
-	return active, nil
-}
 
 // CreateCodexAccountSwitch inserts or returns an idempotent global switch.
 func (s *Store) CreateCodexAccountSwitch(ctx context.Context, rec domain.CodexAccountSwitch) (domain.CodexAccountSwitch, bool, error) {
@@ -86,9 +25,9 @@ func (s *Store) CreateCodexAccountSwitch(ctx context.Context, rec domain.CodexAc
 		var insertErr error
 		n, insertErr = q.InsertCodexAccountSwitch(ctx, gen.InsertCodexAccountSwitchParams{
 			ID: rec.ID, SourceKind: string(rec.SourceKind), SourceAccountID: rec.SourceAccountID, TargetAccountID: rec.TargetAccountID,
-			IdempotencyKey: rec.IdempotencyKey, RequestFingerprint: rec.RequestFingerprint,
-			ExpectedAccountRevision: rec.ExpectedAccountRevision, Phase: string(rec.Phase),
-			CreatedAt: rec.CreatedAt.UTC(), UpdatedAt: rec.UpdatedAt.UTC(),
+			IdempotencyKey: rec.IdempotencyKey,
+			Phase:          string(rec.Phase),
+			CreatedAt:      rec.CreatedAt.UTC(), UpdatedAt: rec.UpdatedAt.UTC(),
 		})
 		return insertErr
 	})
@@ -100,7 +39,7 @@ func (s *Store) CreateCodexAccountSwitch(ctx context.Context, rec domain.CodexAc
 	}
 	if row, readErr := s.qw.GetCodexAccountSwitchByIdempotency(ctx, rec.IdempotencyKey); readErr == nil {
 		existing := codexAccountSwitchFromGen(row)
-		if existing.RequestFingerprint == rec.RequestFingerprint {
+		if existing.TargetAccountID == rec.TargetAccountID {
 			return existing, false, nil
 		}
 		return existing, false, ports.ErrCodexAccountSwitchIdempotencyConflict
@@ -173,7 +112,6 @@ func codexAccountSwitchFromGen(row gen.CodexAccountSwitch) domain.CodexAccountSw
 		Phase: domain.CodexAccountSwitchPhase(row.Phase), FailureCode: row.FailureCode,
 		CredentialsCommittedAt: nullTimeToPtr(row.CredentialsCommittedAt),
 		CreatedAt:              row.CreatedAt, UpdatedAt: row.UpdatedAt, CompletedAt: nullTimeToPtr(row.CompletedAt),
-		IdempotencyKey: row.IdempotencyKey, RequestFingerprint: row.RequestFingerprint,
-		ExpectedAccountRevision: row.ExpectedAccountRevision,
+		IdempotencyKey: row.IdempotencyKey,
 	}
 }

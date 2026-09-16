@@ -156,6 +156,7 @@ type stubCodexAccountClient struct{}
 func (stubCodexAccountClient) Read(context.Context, bool) (ports.CodexAccountObservation, error) {
 	return ports.CodexAccountObservation{Authentication: domain.AgentAuthenticationUnauthorized}, nil
 }
+func (stubCodexAccountClient) Logout(context.Context) error { return nil }
 func (stubCodexAccountClient) ReadCapacity(context.Context) (ports.CodexCapacityObservation, error) {
 	return ports.CodexCapacityObservation{}, nil
 }
@@ -244,7 +245,6 @@ func TestDelegateEndpointDoesNotDependOnCodexDeviceReconciliation(t *testing.T) 
 		CodexSwitchStagingRoot: filepath.Join(root, "staging"),
 		CodexGlobalHome:        globalHome,
 		CodexAccounts:          factory,
-		CodexAccountState:      store,
 		CodexOperationGate:     gate,
 		Clock:                  func() time.Time { return time.Unix(now.Load(), 0) },
 	})
@@ -293,24 +293,18 @@ func TestDelegateEndpointDoesNotDependOnCodexDeviceReconciliation(t *testing.T) 
 		t.Fatalf("ordinary launch opened account-management client %d times", factory.opens.Load())
 	}
 
-	if err := agents.EnsureCodexDeviceAccountReconciled(ctx); err == nil {
-		t.Fatal("first explicit reconciliation unexpectedly succeeded")
+	if err := agents.EnsureCodexDeviceAccountReconciled(ctx); err != nil {
+		t.Fatalf("local device reconciliation: %v", err)
 	}
-
-	now.Add(2)
-	if err := agents.EnsureCodexDeviceAccountReconciled(ctx); err == nil {
-		t.Fatal("unmatched signed-out device credential was treated as a managed account")
-	}
-	// Reconciliation is local-only, including rejection of unidentified tokens.
 	if factory.opens.Load() != 0 {
-		t.Fatalf("local reconciliation opened %d account clients", factory.opens.Load())
+		t.Fatalf("local reconciliation opened account-management client %d times", factory.opens.Load())
 	}
 	accounts, err := agents.CachedCodexAccounts(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if accounts.UnmanagedGlobalAccount == nil || accounts.ActiveAccountID != "" {
-		t.Fatalf("device-only recovery state = %#v", accounts)
+	if accounts.ActiveAccountID == "" || !accounts.DeviceReconciliation.ActiveAccountVerified {
+		t.Fatalf("locally imported device account was not active: %#v", accounts)
 	}
 	if runtime.created != 1 {
 		t.Fatalf("reconciliation restarted sessions: runtime Create calls=%d", runtime.created)

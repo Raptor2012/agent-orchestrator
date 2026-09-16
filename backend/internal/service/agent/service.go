@@ -76,7 +76,6 @@ type Deps struct {
 	CodexSwitchStagingRoot string
 	CodexGlobalHome        string
 	CodexAccounts          ports.CodexAccountClientFactory
-	CodexAccountState      CodexAccountStateStore
 	CodexAccountSwitches   ports.CodexAccountSwitchStore
 	CodexOperationGate     ports.CodexOperationGate
 	// Clock overrides time.Now for deterministic account-bootstrap retry tests.
@@ -106,7 +105,7 @@ func NewWithDeps(deps Deps) *Service {
 	agents := agentregistry.Harnessed()
 	svc := newService(agents, deps.Cache, deps.Projects, deps.Discoverer)
 	if deps.CodexAccountRoot != "" && deps.CodexGlobalHome != "" {
-		svc.codexAccounts = newCodexAccountManager(deps.Context, deps.CodexAccountRoot, deps.CodexPendingRoot, deps.CodexSwitchStagingRoot, deps.CodexGlobalHome, deps.CodexAccounts, deps.CodexAccountState, deps.Logger, deps.CodexOperationGate)
+		svc.codexAccounts = newCodexAccountManager(deps.Context, deps.CodexAccountRoot, deps.CodexPendingRoot, deps.CodexSwitchStagingRoot, deps.CodexGlobalHome, deps.CodexAccounts, deps.Logger, deps.CodexOperationGate)
 		if deps.Clock != nil {
 			svc.codexAccounts.now = deps.Clock
 		}

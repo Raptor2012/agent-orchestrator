@@ -14,6 +14,7 @@ var (
 	ErrCodexOAuthTokenRevoked           = errors.New("codex oauth token revoked")
 	ErrCodexCapacityRequestRejected     = errors.New("codex capacity request rejected")
 	ErrCodexCapacityProviderUnavailable = errors.New("codex capacity provider unavailable")
+	ErrCodexAccountLogoutUnsupported    = errors.New("codex account logout unsupported")
 )
 
 // CodexAccountContext selects the isolated Codex home used by one structured
@@ -77,6 +78,7 @@ type CodexAccountEvent struct {
 // CodexAccountClient owns one app-server process for one account credential home.
 type CodexAccountClient interface {
 	Read(ctx context.Context, refreshToken bool) (CodexAccountObservation, error)
+	Logout(ctx context.Context) error
 	ReadCapacity(ctx context.Context) (CodexCapacityObservation, error)
 	ReadUsage(ctx context.Context) (CodexUsageObservation, error)
 	ConsumeResetCredit(ctx context.Context, idempotencyKey string) (domain.CodexResetCreditOutcome, error)

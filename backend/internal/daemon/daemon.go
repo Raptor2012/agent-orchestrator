@@ -485,7 +485,6 @@ func Run() error {
 		CodexPendingRoot:       filepath.Join(cfg.StateDir, "harnesses", "codex", "pending-accounts"),
 		CodexSwitchStagingRoot: filepath.Join(cfg.StateDir, "harnesses", "codex", "switch-staging"),
 		CodexGlobalHome:        codexHome,
-		CodexAccountState:      store,
 		CodexAccountSwitches:   store,
 		CodexAccounts: codexappserver.NewAccountFactoryWithResolver(func(resolveCtx context.Context) (string, error) {
 			return codexagent.New().ResolveBinary(resolveCtx)
@@ -506,6 +505,13 @@ func Run() error {
 	}
 	sessionSvc.SetChatProviderPreserver(chatSvc.PreservesProviderOnRestart)
 	sessMgr = wiredSessMgr
+	if tunable, ok := sessMgr.(interface {
+		SetModelCatalog(interface {
+			Models(context.Context, string, string, bool) (ports.AgentModelCatalog, error)
+		})
+	}); ok {
+		tunable.SetModelCatalog(agentSvc)
+	}
 
 	// servers isn't clobbered. See preview_wiring.go (issue #4500).
 	wireManagedPreviewExit(managedPreview, sessionSvc, log)
@@ -635,16 +641,10 @@ func Run() error {
 		log.Warn("pr action service disabled: no usable SCM provider")
 	}
 
-	// Durable credential-switch recovery takes the device-global gate before
-	// any session startup can be admitted.
+	// Codex switch recovery is best effort and never blocks unrelated daemon
+	// startup. Its own credential gate still protects any local mutation.
 	if reconcileErr := agentSvc.ReconcileCodexAccountSwitches(ctx); reconcileErr != nil {
-		stop()
-		managedPreview.Close()
-		lcStack.Stop()
-		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
-			log.Error("cdc pipeline shutdown", "err", cdcErr)
-		}
-		return fmt.Errorf("reconcile Codex account switch on boot: %w", reconcileErr)
+		log.Warn("Codex account switch recovery deferred", "err", reconcileErr)
 	}
 
 	// Durable agent-switch and interface-transition recovery is the startup

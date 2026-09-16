@@ -30,7 +30,6 @@ type fakeCodexAccounts struct {
 	resetIdempotencyKey string
 	events              chan agentsvc.CodexAccounts
 	loginStart          agentsvc.CodexAccountLoginTerminalStart
-	deviceLoginOpened   bool
 	verifiedOperation   string
 	cancelledOperation  string
 	reauthenticatedID   string
@@ -39,13 +38,16 @@ type fakeCodexAccounts struct {
 	switchConfig        ports.CodexAccountSwitchConfig
 	switchResult        domain.CodexAccountSwitch
 	switchErr           error
+	switchReadID        string
+	switchReadResult    domain.CodexAccountSwitch
+	switchReadErr       error
 }
 
 func (f *fakeCodexAccounts) CachedCodexAccounts(context.Context) (agentsvc.CodexAccounts, error) {
 	return f.result, nil
 }
-func (f *fakeCodexAccounts) EnsureCodexAccounts(_ context.Context, ids []string, includeUsage, forceAuthentication, forceReconciliation bool) (agentsvc.CodexAccounts, error) {
-	f.ensureIDs, f.includeUsage, f.forceAuthentication, f.forceReconciliation = ids, includeUsage, forceAuthentication, forceReconciliation
+func (f *fakeCodexAccounts) EnsureCodexAccounts(_ context.Context, ids []string, options agentsvc.CodexAccountEnsureOptions) (agentsvc.CodexAccounts, error) {
+	f.ensureIDs, f.includeUsage, f.forceAuthentication, f.forceReconciliation = ids, options.IncludeUsage, options.ForceAuthentication, options.ForceDeviceReconciliation
 	return f.result, nil
 }
 func (f *fakeCodexAccounts) ConsumeCodexAccountResetCredit(_ context.Context, accountID, idempotencyKey string) (agentsvc.CodexAccounts, error) {
@@ -63,10 +65,6 @@ func (f *fakeCodexAccounts) SubscribeCodexAccounts(ctx context.Context) (<-chan 
 func (f *fakeCodexAccounts) OpenCodexAccountLoginTerminal(context.Context) (agentsvc.CodexAccountLoginTerminalStart, error) {
 	return f.loginStart, nil
 }
-func (f *fakeCodexAccounts) OpenCodexDeviceAccountLoginTerminal(context.Context) (agentsvc.CodexAccountLoginTerminalStart, error) {
-	f.deviceLoginOpened = true
-	return f.loginStart, nil
-}
 func (f *fakeCodexAccounts) OpenCodexAccountReauthenticationTerminal(_ context.Context, id string) (agentsvc.CodexAccountLoginTerminalStart, error) {
 	f.reauthenticatedID = id
 	return f.loginStart, nil
@@ -81,7 +79,7 @@ func (f *fakeCodexAccounts) DeleteCodexAccount(_ context.Context, id string) (ag
 }
 func (f *fakeCodexAccounts) VerifyCodexAccountLogin(_ context.Context, id string) (domain.CodexAccountLoginOperation, error) {
 	f.verifiedOperation = id
-	return domain.CodexAccountLoginOperation{OperationID: id, Status: domain.CodexAccountLoginUnverified, ReasonCode: domain.CodexAccountLoginReasonUnverified, Reason: "unverified"}, nil
+	return domain.CodexAccountLoginOperation{OperationID: id, Status: domain.CodexAccountLoginRetryable, ReasonCode: domain.CodexAccountLoginReasonFailed, Reason: "try again"}, nil
 }
 func (f *fakeCodexAccounts) CancelCodexAccountLogin(_ context.Context, id string) (domain.CodexAccountLoginOperation, error) {
 	f.cancelledOperation = id
@@ -91,10 +89,10 @@ func (f *fakeCodexAccounts) StartCodexAccountSwitch(_ context.Context, cfg ports
 	f.switchConfig = cfg
 	return f.switchResult, f.switchErr
 }
-func (f *fakeCodexAccounts) RecoverCodexAccountSwitch(context.Context, string) (domain.CodexAccountSwitch, error) {
-	return f.switchResult, nil
+func (f *fakeCodexAccounts) GetCodexAccountSwitch(_ context.Context, id string) (domain.CodexAccountSwitch, error) {
+	f.switchReadID = id
+	return f.switchReadResult, f.switchReadErr
 }
-
 func codexAccountsFixture() agentsvc.CodexAccounts {
 	supported := domain.CodexCapabilityObservation{State: domain.CodexCapabilitySupported, ReasonCode: "supported", Reason: "available"}
 	remaining := 95.0
@@ -128,7 +126,7 @@ func codexAccountsFixture() agentsvc.CodexAccounts {
 				ResetCredits: &domain.CodexResetCreditsSummary{AvailableCount: 2, NearestExpiresAt: &resetsAt},
 			},
 		}},
-		Capabilities: domain.CodexAccountCapabilities{AccountRead: supported, NativeLogin: supported, CapacityRead: supported, UsageRead: supported, ResetCreditConsume: supported, ThreadResume: supported, AccountManagement: supported, GlobalSwitch: supported},
+		Capabilities: domain.CodexAccountCapabilities{AccountRead: supported, NativeLogin: supported, CapacityRead: supported, UsageRead: supported, ResetCreditConsume: supported, GlobalSwitch: supported},
 	}
 }
 
@@ -141,7 +139,7 @@ func TestCodexAccountRoutesExposeSafeCachedAndEnsureShapes(t *testing.T) {
 	fixture := codexAccountsFixture()
 	fixture.CurrentSwitch = &domain.CodexAccountSwitch{
 		ID: "switch-1", SourceAccountID: "source-account", TargetAccountID: "target-account",
-		Phase: domain.CodexAccountSwitchVerifyingAccount,
+		Phase: domain.CodexAccountSwitchRecoveryRequired,
 	}
 	fake := &fakeCodexAccounts{result: fixture}
 	srv := newCodexAccountServer(t, fake)
@@ -156,7 +154,7 @@ func TestCodexAccountRoutesExposeSafeCachedAndEnsureShapes(t *testing.T) {
 			t.Fatalf("GET leaked %q: %s", forbidden, body)
 		}
 	}
-	for _, unusedCapability := range []string{"accountRead", "capacityRead", "usageRead", "threadResume", "accountManagement"} {
+	for _, unusedCapability := range []string{"accountRead", "capacityRead", "usageRead"} {
 		if strings.Contains(text, `"`+unusedCapability+`"`) {
 			t.Fatalf("GET exposed unused capability %q: %s", unusedCapability, body)
 		}
@@ -233,14 +231,6 @@ func TestCodexAccountLoginTerminalAndVerificationRoutesExposeNoCommandOrPath(t *
 	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/accounts/login-terminal", `{}`)
 	if status != http.StatusBadRequest || !strings.Contains(string(body), `"code":"INVALID_REQUEST_BODY"`) {
 		t.Fatalf("body rejection status=%d body=%s", status, body)
-	}
-	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/accounts/device/login-terminal", "")
-	if status != http.StatusAccepted || !fake.deviceLoginOpened || !strings.Contains(string(body), `"operationId":"op-1"`) {
-		t.Fatalf("device login status=%d opened=%t body=%s", status, fake.deviceLoginOpened, body)
-	}
-	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/accounts/device/login-terminal", `{}`)
-	if status != http.StatusBadRequest || !strings.Contains(string(body), `"code":"INVALID_REQUEST_BODY"`) {
-		t.Fatalf("device body rejection status=%d body=%s", status, body)
 	}
 	_, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/accounts/login-operations/op-1/verify", "")
 	if status != http.StatusOK || fake.verifiedOperation != "op-1" {
@@ -356,7 +346,7 @@ func TestCodexAccountResetCreditRouteRequiresIdempotencyAndReturnsRefreshedAccou
 func TestCodexAccountSwitchRequiresIdempotencyAndRedactsPrivateIdentity(t *testing.T) {
 	fake := &fakeCodexAccounts{result: codexAccountsFixture(), switchResult: domain.CodexAccountSwitch{
 		ID: "switch-1", SourceAccountID: "source", TargetAccountID: "target", Phase: domain.CodexAccountSwitchRequested,
-		IdempotencyKey: "private-key", RequestFingerprint: "private-fingerprint", ExpectedAccountRevision: 3,
+		IdempotencyKey: "private-key",
 	}}
 	srv := newCodexAccountServer(t, fake)
 	defer srv.Close()
@@ -366,50 +356,42 @@ func TestCodexAccountSwitchRequiresIdempotencyAndRedactsPrivateIdentity(t *testi
 	}
 	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/account-switches", `{"targetAccountId":"target","expectedAccountRevision":3,"idempotencyKey":"request-key"}`)
 	text := string(body)
-	if status != http.StatusAccepted || fake.switchConfig.IdempotencyKey != "request-key" ||
-		strings.Contains(text, `"restartRunningSessions"`) || strings.Contains(text, `"sessions"`) {
+	if status != http.StatusAccepted || fake.switchConfig.IdempotencyKey != "request-key" || strings.Contains(text, `"sessions"`) {
 		t.Fatalf("switch status=%d config=%#v body=%s", status, fake.switchConfig, body)
 	}
-	for _, forbidden := range []string{"private-key", "private-fingerprint"} {
+	for _, forbidden := range []string{"private-key"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("switch leaked %q: %s", forbidden, body)
 		}
 	}
-	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/account-switches", `{"targetAccountId":"target","expectedAccountRevision":3,"idempotencyKey":"obsolete-key","restartRunningSessions":true}`)
-	if status != http.StatusBadRequest || !strings.Contains(string(body), `"code":"INVALID_JSON"`) {
-		t.Fatalf("obsolete restart field status=%d body=%s", status, body)
-	}
 }
 
-func TestCodexAccountSwitchWithoutReconciledSourceReturnsTypedConflict(t *testing.T) {
-	fake := &fakeCodexAccounts{
-		result:    codexAccountsFixture(),
-		switchErr: ports.ErrCodexActiveAccountUnavailable,
-	}
+func TestCodexAccountSwitchReadReturnsDurableStateAndRedactsPrivateIdentity(t *testing.T) {
+	fake := &fakeCodexAccounts{result: codexAccountsFixture(), switchReadResult: domain.CodexAccountSwitch{
+		ID: "switch-1", SourceAccountID: "source", TargetAccountID: "target", Phase: domain.CodexAccountSwitchCompleted,
+		IdempotencyKey: "private-key",
+	}}
 	srv := newCodexAccountServer(t, fake)
 	defer srv.Close()
-	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/account-switches", `{"targetAccountId":"target","expectedAccountRevision":3,"idempotencyKey":"request-key"}`)
-	if status != http.StatusConflict || !strings.Contains(string(body), `"code":"CODEX_ACCOUNT_AUTH_UNVERIFIED"`) {
-		t.Fatalf("unreconciled switch status=%d body=%s", status, body)
+	body, status, _ := doRequest(t, srv, http.MethodGet, "/api/v1/agents/codex/account-switches/switch-1", "")
+	text := string(body)
+	if status != http.StatusOK || fake.switchReadID != "switch-1" || !strings.Contains(text, `"phase":"completed"`) {
+		t.Fatalf("switch read status=%d id=%q body=%s", status, fake.switchReadID, body)
+	}
+	for _, forbidden := range []string{"private-key"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("switch read leaked %q: %s", forbidden, body)
+		}
 	}
 }
 
-func TestCodexAccountSwitchReadAndCancelRoutesAreNotRegistered(t *testing.T) {
+func TestCodexAccountSwitchCancelRouteIsNotRegistered(t *testing.T) {
 	fake := &fakeCodexAccounts{result: codexAccountsFixture()}
 	srv := newCodexAccountServer(t, fake)
 	defer srv.Close()
-
-	for _, request := range []struct {
-		method string
-		path   string
-	}{
-		{method: http.MethodGet, path: "/api/v1/agents/codex/account-switches/switch-1"},
-		{method: http.MethodPost, path: "/api/v1/agents/codex/account-switches/switch-1/cancel"},
-	} {
-		_, status, _ := doRequest(t, srv, request.method, request.path, "")
-		if status != http.StatusNotFound {
-			t.Errorf("%s %s status = %d, want %d", request.method, request.path, status, http.StatusNotFound)
-		}
+	_, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/agents/codex/account-switches/switch-1/cancel", "")
+	if status != http.StatusNotFound {
+		t.Errorf("cancel status = %d, want %d", status, http.StatusNotFound)
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +15,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+const codexDeviceReconciliationAutomaticAttempts = 3
 
 // Account-store initialization covers AO-owned local state only. Device-global
 // discovery is deliberately a separate, repeatable operation below.
@@ -31,7 +32,7 @@ func (m *codexAccountManager) waitAccountStore(ctx context.Context) error {
 	call := m.accountStoreCall
 	if call == nil {
 		if m.accountStoreErr != nil {
-			var failure *codexAccountStoreFailure
+			var failure *codexAccountLocalFailure
 			if !errors.As(m.accountStoreErr, &failure) || !failure.retryable || m.now().Before(m.accountStoreNextRetry) {
 				err := m.accountStoreErr
 				m.mu.Unlock()
@@ -66,7 +67,7 @@ func (m *codexAccountManager) runAccountStoreInitialization(call *accountReconci
 		// temporarily unavailable disk or database.
 		delay := time.Second << min(m.accountStoreFailures-1, 5)
 		m.accountStoreNextRetry = m.now().Add(delay)
-		var failure *codexAccountStoreFailure
+		var failure *codexAccountLocalFailure
 		if errors.As(err, &failure) {
 			m.logger.Warn("Codex account store initialization failed", "reasonCode", failure.reason, "retryable", failure.retryable)
 		}
@@ -78,17 +79,17 @@ func (m *codexAccountManager) runAccountStoreInitialization(call *accountReconci
 	m.publish()
 }
 
-// Only allowlisted metadata crosses the API/log boundary. Provider errors can
-// contain credential bytes or paths and must never be rendered there.
-type codexAccountStoreFailure struct {
+// codexAccountLocalFailure contains only a safe category. The underlying
+// filesystem error is deliberately not retained because it can contain paths.
+type codexAccountLocalFailure struct {
 	reason    string
 	retryable bool
 }
 
-func (e *codexAccountStoreFailure) Error() string { return e.reason }
+func (e *codexAccountLocalFailure) Error() string { return e.reason }
 
 func accountStoreFailure(reason string, retryable bool) error {
-	return &codexAccountStoreFailure{reason: reason, retryable: retryable}
+	return &codexAccountLocalFailure{reason: reason, retryable: retryable}
 }
 
 func accountStoreStorageFailure(err error) error {
@@ -108,68 +109,27 @@ func accountStoreStorageFailure(err error) error {
 	return accountStoreFailure("account_storage_unavailable", true)
 }
 
-func accountStoreStateFailure(err error) error {
-	if errors.Is(err, ports.ErrCodexGlobalAccountChanged) {
-		return accountStoreFailure("global_account_changed", false)
-	}
-	return accountStoreFailure("account_state_unavailable", !errors.Is(err, context.Canceled))
-}
-
 func (m *codexAccountManager) initializeAccountStore() error {
 	if err := cleanupPendingCredentialHomes(m.pendingRoot); err != nil {
 		return accountStoreStorageFailure(err)
 	}
-	// Durable switches may keep a private rollback checkpoint here across a
-	// daemon restart. The switch coordinator removes terminal operation data.
+	// Durable switches keep their private target snapshot here across a daemon
+	// restart. The switch coordinator removes terminal operation data.
 	if err := ensurePrivateDirectory(m.switchStagingRoot); err != nil {
 		return accountStoreStorageFailure(err)
 	}
 	if err := m.catalog.refresh(); err != nil {
 		return accountStoreStorageFailure(err)
 	}
-	if m.stateStore != nil {
-		ctx, cancel := context.WithTimeout(m.ctx, codexAccountAuthTimeout)
-		defer cancel()
-		active, ok, err := m.stateStore.GetCodexActiveAccount(ctx)
-		if err != nil {
-			return accountStoreStateFailure(err)
-		}
-		if ok {
-			m.mu.Lock()
-			m.active = active
-			m.mu.Unlock()
-		}
-	}
 	return nil
 }
 
-// codexDeviceReconciliationFailure contains only a safe category. The wrapped
-// provider error is intentionally not retained because it can contain tokens
-// or credential paths.
-type codexDeviceReconciliationFailure struct {
-	reason    string
-	retryable bool
-}
-
-func (e *codexDeviceReconciliationFailure) Error() string { return e.reason }
-
 func deviceReconciliationFailure(reason string, retryable bool) error {
-	return &codexDeviceReconciliationFailure{reason: reason, retryable: retryable}
-}
-
-func deviceReconciliationStateFailure(err error) error {
-	if errors.Is(err, ports.ErrCodexGlobalAccountChanged) {
-		return deviceReconciliationFailure("global_account_changed", true)
-	}
-	return deviceReconciliationFailure("account_state_unavailable", !errors.Is(err, context.Canceled))
+	return &codexAccountLocalFailure{reason: reason, retryable: retryable}
 }
 
 func deviceReconciliationStorageFailure(err error) error {
-	var localFailure *codexAccountStoreFailure
-	if errors.As(accountStoreStorageFailure(err), &localFailure) {
-		return deviceReconciliationFailure(localFailure.reason, localFailure.retryable)
-	}
-	return deviceReconciliationFailure("account_reconciliation_unavailable", true)
+	return accountStoreStorageFailure(err)
 }
 
 func (m *codexAccountManager) reconcileGlobal(ctx context.Context) error {
@@ -204,11 +164,10 @@ func (m *codexAccountManager) reconcileGlobalWithPolicy(ctx context.Context, for
 		// Stop routing the last-known active slot through the global home until
 		// this attempt has matched the current credential. Otherwise an external
 		// A -> B login can write B's observations into A's saved slot. Keep the
-		// last matched device account for presentation only so a fast local check
-		// does not make the active row disappear and reappear in Settings.
-		m.deferredAccountID = m.active.AccountID
+		// last matched device account only as a safety hint for mutation routing;
+		// the API/UI must not present it as active until this check verifies it.
+		m.deferredAccountID = m.deviceAccountID
 		m.deviceCredentialPresent = false
-		m.unmanaged = nil
 		started = true
 		go m.runGlobalReconciliation(call)
 	}
@@ -263,16 +222,10 @@ func (m *codexAccountManager) runGlobalReconciliation(call *accountReconcileCall
 		m.reconcileFailures = 0
 		m.reconciliation.Retryable = false
 		m.reconciliation.NextRetryAt = nil
-		if m.unmanaged != nil {
-			m.reconciliation.Status = domain.CodexDeviceReconciliationBlocked
-			m.reconciliation.ActiveAccountVerified = false
-			m.reconciliation.ReasonCode = m.unmanaged.ReasonCode
-		} else {
-			m.reconciliation.Status = domain.CodexDeviceReconciliationVerified
-			m.reconciliation.ActiveAccountVerified = m.active.AccountID != ""
-			m.reconciliation.ReasonCode = "verified"
-			m.reconciliation.VerifiedAt = timePointer(now)
-		}
+		m.reconciliation.Status = domain.CodexDeviceReconciliationVerified
+		m.reconciliation.ActiveAccountVerified = m.deviceAccountID != ""
+		m.reconciliation.ReasonCode = "verified"
+		m.reconciliation.VerifiedAt = timePointer(now)
 	} else if !errors.Is(call.err, context.Canceled) || m.ctx.Err() == nil {
 		failure := classifyDeviceReconciliationFailure(call.err)
 		// The retained deviceAccountID is presentation-only while the local check
@@ -288,7 +241,11 @@ func (m *codexAccountManager) runGlobalReconciliation(call *accountReconcileCall
 			delay = time.Second << min(m.reconcileFailures-1, 5)
 			next := now.Add(delay)
 			m.reconciliation.NextRetryAt = timePointer(next)
-			schedule = !m.reconcileScheduled
+			// Make the first three local attempts automatic (immediate, +1s,
+			// +2s). After that the UI becomes actionable instead of retrying
+			// forever in the background. A manual retry remains available only
+			// for failures classified as transient.
+			schedule = m.reconcileFailures < codexDeviceReconciliationAutomaticAttempts && !m.reconcileScheduled
 			if schedule {
 				m.reconcileScheduled = true
 			}
@@ -309,18 +266,18 @@ func (m *codexAccountManager) runGlobalReconciliation(call *accountReconcileCall
 	}
 }
 
-func classifyDeviceReconciliationFailure(err error) *codexDeviceReconciliationFailure {
-	var failure *codexDeviceReconciliationFailure
+func classifyDeviceReconciliationFailure(err error) *codexAccountLocalFailure {
+	var failure *codexAccountLocalFailure
 	if errors.As(err, &failure) {
 		return failure
 	}
 	if errors.Is(err, ports.ErrCodexGlobalAccountChanged) {
-		return &codexDeviceReconciliationFailure{reason: "global_account_changed", retryable: true}
+		return &codexAccountLocalFailure{reason: "global_account_changed", retryable: true}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &codexDeviceReconciliationFailure{reason: "account_reconciliation_timeout", retryable: true}
+		return &codexAccountLocalFailure{reason: "account_reconciliation_timeout", retryable: true}
 	}
-	return &codexDeviceReconciliationFailure{reason: "account_reconciliation_unavailable", retryable: true}
+	return &codexAccountLocalFailure{reason: "account_reconciliation_unavailable", retryable: true}
 }
 
 func (m *codexAccountManager) scheduleGlobalReconciliation(delay time.Duration) {
@@ -382,16 +339,11 @@ func (m *codexAccountManager) reconcileGlobalInner(ctx context.Context) error {
 		return deviceReconciliationStorageFailure(credentialErr)
 	}
 	if !admitted.exists {
-		m.setGlobalAuthentication(accountAuthenticationObservation(m.now(), domain.AgentAuthenticationUnauthorized))
 		m.mu.Lock()
 		m.deviceAccountID = ""
 		m.deferredAccountID = ""
 		m.deviceCredentialPresent = false
-		m.unmanaged = nil
 		m.mu.Unlock()
-		if err := m.setActivePointer(ctx, ""); err != nil {
-			return deviceReconciliationStateFailure(err)
-		}
 		return nil
 	}
 
@@ -413,15 +365,6 @@ func (m *codexAccountManager) reconcileGlobalInner(ctx context.Context) error {
 	credentialChanged := false
 	imported := false
 	if match == codexCredentialMatchNone {
-		// An opaque token can identify an existing saved credential by exact
-		// match, but cannot establish the identity of a new managed account.
-		if identity.ProviderAccountID == "" && identity.Method != domain.CodexAuthMethodAPIKey {
-			if err := m.setActivePointer(ctx, ""); err != nil {
-				return deviceReconciliationStateFailure(err)
-			}
-			m.setUnmanagedGlobal("Device Codex account", identity.Method, nil, "global_account_unverified", "AO could not verify the device's current Codex account.")
-			return deviceReconciliationFailure("global_account_unverified", false)
-		}
 		var importErr error
 		record, importErr = m.importGlobalCredential(globalCredential, identity)
 		if importErr != nil {
@@ -444,7 +387,7 @@ func (m *codexAccountManager) reconcileGlobalInner(ctx context.Context) error {
 		discardImport()
 		return deviceReconciliationStorageFailure(err)
 	}
-	if err := m.catalog.updateCredentialIdentity(record.Snapshot.ID, globalCredential); err != nil {
+	if err := m.catalog.updateCredentialIdentity(ctx, record.Snapshot.ID, globalCredential); err != nil {
 		discardImport()
 		return deviceReconciliationStorageFailure(err)
 	}
@@ -456,9 +399,6 @@ func (m *codexAccountManager) reconcileGlobalInner(ctx context.Context) error {
 	if finalErr != nil || !sameCodexFileState(admitted, finalState) || !bytes.Equal(finalGlobal, globalCredential) {
 		discardImport()
 		return deviceReconciliationFailure("global_account_changed", true)
-	}
-	if err := m.setActivePointer(ctx, record.Snapshot.ID); err != nil {
-		return deviceReconciliationStateFailure(err)
 	}
 	m.setManagedGlobal(record.Snapshot.ID)
 	if credentialChanged {
@@ -568,98 +508,9 @@ func (m *codexAccountManager) importGlobalCredential(credential []byte, identity
 	return record, nil
 }
 
-func (m *codexAccountManager) matchGlobalAccount(observation ports.CodexAccountObservation, globalCredential []byte) (codexAccountRecord, bool) {
-	records, err := m.catalog.recordsFor(nil)
-	if err != nil {
-		return codexAccountRecord{}, false
-	}
-	m.mu.Lock()
-	activeID := m.active.AccountID
-	m.mu.Unlock()
-	if active, ok := m.catalog.record(activeID); ok && (active.Snapshot.Status == domain.CodexAccountStatusValid || active.Snapshot.Status == domain.CodexAccountStatusSignedOut) {
-		if sameCodexStructuredIdentity(active.Snapshot, observation) {
-			return active, true
-		}
-	}
-	if distinguishableCodexIdentity(observation) {
-		var matched *codexAccountRecord
-		for i := range records {
-			record := records[i]
-			if (record.Snapshot.Status == domain.CodexAccountStatusValid || record.Snapshot.Status == domain.CodexAccountStatusSignedOut) && sameCodexStructuredIdentity(record.Snapshot, observation) && (matched == nil || record.VerifiedAt.After(matched.VerifiedAt)) {
-				candidate := record
-				matched = &candidate
-			}
-		}
-		if matched != nil {
-			return *matched, true
-		}
-		return codexAccountRecord{}, false
-	}
-	var opaqueMatch *codexAccountRecord
-	for i := range records {
-		record := records[i]
-		if record.Snapshot.Status != domain.CodexAccountStatusValid || !credentialMatchesRecord(record, globalCredential) {
-			continue
-		}
-		if opaqueMatch != nil {
-			return codexAccountRecord{}, false
-		}
-		candidate := record
-		opaqueMatch = &candidate
-	}
-	if opaqueMatch != nil {
-		return *opaqueMatch, true
-	}
-	return codexAccountRecord{}, false
-}
-
 func credentialMatchesRecord(record codexAccountRecord, credential []byte) bool {
 	stored, err := readOpaqueCredential(filepath.Join(record.Home, codexCredentialFilename))
 	return err == nil && bytes.Equal(stored, credential)
-}
-
-func (m *codexAccountManager) observationAndCredentialIdentifyRecord(record codexAccountRecord, observation ports.CodexAccountObservation, credential []byte) bool {
-	if distinguishableCodexIdentity(observation) {
-		return sameCodexStructuredIdentity(record.Snapshot, observation)
-	}
-	matched, ok := m.matchGlobalAccount(observation, credential)
-	return ok && matched.Snapshot.ID == record.Snapshot.ID
-}
-
-func distinguishableCodexIdentity(observation ports.CodexAccountObservation) bool {
-	return observation.Method != domain.CodexAuthMethodUnknown && observation.Email != nil && safeAccountEmail(*observation.Email)
-}
-
-func sameCodexStructuredIdentity(snapshot domain.CodexAccountSnapshot, observation ports.CodexAccountObservation) bool {
-	if snapshot.AuthMethod != observation.Method || !distinguishableCodexIdentity(observation) || snapshot.AccountEmail == nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(*snapshot.AccountEmail), strings.TrimSpace(*observation.Email))
-}
-
-func codexObservationMatchesAccount(snapshot domain.CodexAccountSnapshot, observation ports.CodexAccountObservation) bool {
-	if sameCodexStructuredIdentity(snapshot, observation) {
-		return true
-	}
-	return snapshot.AuthMethod == domain.CodexAuthMethodAPIKey && observation.Method == domain.CodexAuthMethodAPIKey
-}
-
-func codexObservationsMatch(left, right ports.CodexAccountObservation) bool {
-	if left.Method != right.Method {
-		return false
-	}
-	if left.Email != nil && right.Email != nil && safeAccountEmail(*left.Email) && safeAccountEmail(*right.Email) {
-		return strings.EqualFold(strings.TrimSpace(*left.Email), strings.TrimSpace(*right.Email))
-	}
-	return left.Method == domain.CodexAuthMethodAPIKey
-}
-
-func (m *codexAccountManager) setUnmanagedGlobal(label string, method domain.CodexAuthMethod, email *string, code, reason string) {
-	m.mu.Lock()
-	m.deviceAccountID = ""
-	m.deviceCredentialPresent = true
-	m.unmanaged = &domain.CodexUnmanagedGlobalAccount{Label: label, AuthMethod: method, AccountEmail: email, ReasonCode: code, Reason: reason}
-	m.mu.Unlock()
 }
 
 func (m *codexAccountManager) setManagedGlobal(accountID string) {
@@ -667,72 +518,8 @@ func (m *codexAccountManager) setManagedGlobal(accountID string) {
 	m.deviceAccountID = accountID
 	m.deferredAccountID = ""
 	m.deviceCredentialPresent = true
-	m.unmanaged = nil
 	m.reconciliation.ActiveAccountVerified = accountID != ""
 	m.mu.Unlock()
-}
-
-func (m *codexAccountManager) setGlobalAuthentication(observation domain.AgentAuthenticationObservation) {
-	m.mu.Lock()
-	m.globalAuth = observation
-	m.mu.Unlock()
-}
-
-func (m *codexAccountManager) setActivePointer(ctx context.Context, accountID string) error {
-	m.mu.Lock()
-	current := m.active
-	m.mu.Unlock()
-	if current.AccountID == accountID {
-		return nil
-	}
-	now := m.now()
-	active, _, err := m.commitActivePointer(ctx, accountID, current, now)
-	if err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.active = active
-	m.mu.Unlock()
-	return nil
-}
-
-type activePointerCommitOutcome uint8
-
-const (
-	activePointerUnchanged activePointerCommitOutcome = iota
-	activePointerCommitted
-	activePointerUncertain
-)
-
-func (m *codexAccountManager) commitActivePointer(
-	ctx context.Context,
-	accountID string,
-	current domain.CodexActiveAccount,
-	at time.Time,
-) (domain.CodexActiveAccount, activePointerCommitOutcome, error) {
-	if m.stateStore == nil {
-		return domain.CodexActiveAccount{
-			AccountID: accountID, Revision: current.Revision + 1, ActivatedAt: at, UpdatedAt: at,
-		}, activePointerCommitted, nil
-	}
-	active, err := m.stateStore.SetCodexActiveAccount(ctx, accountID, current.Revision, at)
-	if err == nil {
-		return active, activePointerCommitted, nil
-	}
-	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexAccountAuthTimeout)
-	defer cancel()
-	settled, found, readErr := m.stateStore.GetCodexActiveAccount(settleCtx)
-	if readErr != nil {
-		return domain.CodexActiveAccount{}, activePointerUncertain, errors.Join(err, readErr)
-	}
-	if found && settled.AccountID == accountID && settled.Revision == current.Revision+1 {
-		return settled, activePointerCommitted, nil
-	}
-	if (found && settled.AccountID == current.AccountID && settled.Revision == current.Revision) ||
-		(!found && current.Revision == 0) {
-		return domain.CodexActiveAccount{}, activePointerUnchanged, err
-	}
-	return settled, activePointerUncertain, errors.Join(err, ports.ErrCodexGlobalAccountChanged)
 }
 
 func mapUnknownCodexAccount(err error) error {

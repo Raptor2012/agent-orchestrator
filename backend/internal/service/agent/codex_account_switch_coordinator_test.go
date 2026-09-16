@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -16,10 +15,14 @@ import (
 )
 
 type coordinatorCredentialFake struct {
-	mu          sync.Mutex
-	active      domain.CodexActiveAccount
-	calls       []string
-	activateErr error
+	mu              sync.Mutex
+	source          domain.CodexAccountSwitchSource
+	installedTarget bool
+	inspectionState domain.CodexAccountSwitchInstallationState
+	confirmErrs     []error
+	confirmStarted  chan struct{}
+	activateErr     error
+	calls           []string
 }
 
 func (f *coordinatorCredentialFake) call(value string) {
@@ -41,58 +44,58 @@ func (f *coordinatorCredentialFake) BeginCodexAccountMutation(context.Context) e
 	return nil
 }
 func (f *coordinatorCredentialFake) EndCodexAccountMutation() { f.call("end") }
-func (f *coordinatorCredentialFake) CurrentCodexActiveAccount() domain.CodexActiveAccount {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.active
+func (f *coordinatorCredentialFake) PrepareCodexAccountForSwitch(_ context.Context, switchID, targetID string) (domain.CodexAccountSwitchSource, error) {
+	f.call("prepare:" + switchID + ":" + targetID)
+	return f.source, nil
 }
-func (f *coordinatorCredentialFake) CurrentCodexAccountSwitchSource() domain.CodexAccountSwitchSource {
+func (f *coordinatorCredentialFake) InspectCodexAccountSwitch(_ context.Context, switchID string, _ domain.CodexAccountSwitchSourceKind, _, targetID string) (domain.CodexAccountSwitchInstallationState, error) {
+	f.call("confirm:" + switchID + ":" + targetID)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return domain.CodexAccountSwitchSource{
-		Kind: domain.CodexAccountSwitchSourceManaged, AccountID: f.active.AccountID, Revision: f.active.Revision,
+	if f.confirmStarted != nil {
+		select {
+		case f.confirmStarted <- struct{}{}:
+		default:
+		}
 	}
-}
-func (*coordinatorCredentialFake) CodexAccountLoginInProgress() bool { return false }
-func (f *coordinatorCredentialFake) VerifyCodexAccountForSwitch(_ context.Context, id string) error {
-	f.call("verify-target:" + id)
-	return nil
-}
-func (f *coordinatorCredentialFake) VerifyCurrentCodexAccount(_ context.Context, id string) error {
-	f.call("verify-current:" + id)
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.active.AccountID != id {
-		return errors.New("unexpected active account")
+	if len(f.confirmErrs) > 0 {
+		err := f.confirmErrs[0]
+		f.confirmErrs = f.confirmErrs[1:]
+		if err != nil {
+			return "", err
+		}
 	}
-	return nil
+	if !f.installedTarget {
+		if f.inspectionState != "" {
+			return f.inspectionState, nil
+		}
+		return domain.CodexAccountSwitchExternalCredential, nil
+	}
+	return domain.CodexAccountSwitchTargetInstalled, nil
 }
-func (f *coordinatorCredentialFake) CheckpointAndActivateCodexAccount(_ context.Context, _ domain.CodexAccountSwitchSourceKind, _ string, target string, expected int64) (domain.CodexActiveAccount, error) {
-	f.call("activate:" + target)
+func (f *coordinatorCredentialFake) ActivatePreparedCodexAccountSwitch(_ context.Context, _ domain.CodexAccountSwitchSourceKind, switchID, targetID string) error {
+	f.call("activate:" + switchID + ":" + targetID)
 	if f.activateErr != nil {
-		return domain.CodexActiveAccount{}, f.activateErr
+		return f.activateErr
 	}
 	f.mu.Lock()
-	f.active = domain.CodexActiveAccount{AccountID: target, Revision: expected + 1}
-	active := f.active
-	f.mu.Unlock()
-	return active, nil
-}
-func (f *coordinatorCredentialFake) RestoreCodexAccountCredential(_ context.Context, _ string, _ domain.CodexAccountSwitchSourceKind, source, _ string) error {
-	f.call("restore:" + source)
-	f.mu.Lock()
-	f.active.AccountID = source
+	f.installedTarget = true
 	f.mu.Unlock()
 	return nil
 }
-func (f *coordinatorCredentialFake) CleanupCodexAccountSwitch(context.Context, string) error {
-	f.call("cleanup")
+func (f *coordinatorCredentialFake) CleanupCodexAccountSwitch(_ context.Context, switchID string) error {
+	f.call("cleanup:" + switchID)
+	return nil
+}
+func (f *coordinatorCredentialFake) CleanupInactiveCodexAccountSwitches(_ context.Context, activeSwitchID string) error {
+	f.call("cleanup-inactive:" + activeSwitchID)
 	return nil
 }
 
 type coordinatorSwitchStoreFake struct {
-	mu     sync.Mutex
-	record domain.CodexAccountSwitch
+	mu      sync.Mutex
+	record  domain.CodexAccountSwitch
+	readErr error
 }
 
 func (s *coordinatorSwitchStoreFake) CreateCodexAccountSwitch(_ context.Context, record domain.CodexAccountSwitch) (domain.CodexAccountSwitch, bool, error) {
@@ -117,6 +120,9 @@ func (s *coordinatorSwitchStoreFake) GetCodexAccountSwitchByIdempotency(_ contex
 func (s *coordinatorSwitchStoreFake) GetActiveCodexAccountSwitch(context.Context) (domain.CodexAccountSwitch, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.readErr != nil {
+		return domain.CodexAccountSwitch{}, false, s.readErr
+	}
 	return s.record, s.record.ID != "" && !s.record.Phase.Terminal(), nil
 }
 func (s *coordinatorSwitchStoreFake) UpdateCodexAccountSwitch(_ context.Context, record domain.CodexAccountSwitch, expected domain.CodexAccountSwitchPhase) (bool, error) {
@@ -129,97 +135,12 @@ func (s *coordinatorSwitchStoreFake) UpdateCodexAccountSwitch(_ context.Context,
 	return true, nil
 }
 
-func TestCodexAccountSwitchFingerprintIsVersionedAndStable(t *testing.T) {
-	first := codexAccountSwitchFingerprint("account-b", 7)
-	if !strings.HasPrefix(first, "v3:") || len(first) != len("v3:")+64 {
-		t.Fatalf("fingerprint = %q", first)
-	}
-	if first != codexAccountSwitchFingerprint("account-b", 7) || first == codexAccountSwitchFingerprint("account-b", 8) {
-		t.Fatal("fingerprint is not stable and revision-specific")
-	}
-}
-
-func TestCodexAccountSwitchCoordinatorCompletesCredentialOnlySwitch(t *testing.T) {
-	credentials := &coordinatorCredentialFake{active: domain.CodexActiveAccount{AccountID: "source", Revision: 1}}
+func TestCodexAccountSwitchCoordinatorCompletesLocalCredentialSwitch(t *testing.T) {
+	credentials := &coordinatorCredentialFake{source: domain.CodexAccountSwitchSource{Kind: domain.CodexAccountSwitchSourceManaged, AccountID: "source"}}
 	store := &coordinatorSwitchStoreFake{}
 	coordinator := newCodexAccountSwitchCoordinator(context.Background(), credentials, store, codexops.NewGate(), time.Now, nil)
 
-	if _, err := coordinator.StartCodexAccountSwitch(context.Background(), ports.CodexAccountSwitchConfig{
-		TargetAccountID: "target", ExpectedAccountRevision: 1, IdempotencyKey: "request-1",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := coordinator.Wait(waitCtx); err != nil {
-		t.Fatal(err)
-	}
-
-	store.mu.Lock()
-	phase := store.record.Phase
-	store.mu.Unlock()
-	if phase != domain.CodexAccountSwitchCompleted {
-		t.Fatalf("phase = %q, want completed", phase)
-	}
-	credentials.mu.Lock()
-	calls := append([]string(nil), credentials.calls...)
-	credentials.mu.Unlock()
-	for _, want := range []string{"store", "reconcile", "begin", "verify-target:target", "activate:target", "verify-current:target", "cleanup", "end"} {
-		if !slices.Contains(calls, want) {
-			t.Fatalf("calls = %v, missing %q", calls, want)
-		}
-	}
-}
-
-func TestCodexAccountSwitchCoordinatorActivatesSavedAccountWhenDeviceCredentialIsMissing(t *testing.T) {
-	root := t.TempDir()
-	globalHome := filepath.Join(root, "global-codex")
-	if err := ensurePrivateDirectory(globalHome); err != nil {
-		t.Fatal(err)
-	}
-	credential := testAPIKeyCredential("saved-target-key")
-	factory := &fakeCodexAccountFactory{
-		capabilities: supportedCodexAccountCapabilities(),
-		open: func(ports.CodexAccountContext) (ports.CodexAccountClient, error) {
-			return &fakeCodexAccountClient{read: ports.CodexAccountObservation{
-				Authentication: domain.AgentAuthenticationAuthorized,
-				Method:         domain.CodexAuthMethodAPIKey,
-			}}, nil
-		},
-	}
-	manager := newCodexAccountManager(
-		context.Background(),
-		filepath.Join(root, "accounts"),
-		filepath.Join(root, "pending"),
-		filepath.Join(root, "staging"),
-		globalHome,
-		factory,
-		nil,
-		nil,
-	)
-	manager.catalog.newID = func() string { return testAccountID }
-	target := commitTestAccountWithCredential(
-		t,
-		manager.catalog,
-		manager.pendingRoot,
-		"b60a377d-da68-4a61-86f2-f31f04c571f2",
-		credential,
-		ports.CodexAccountObservation{
-			Authentication: domain.AgentAuthenticationAuthorized,
-			Method:         domain.CodexAuthMethodAPIKey,
-		},
-	)
-	manager.mu.Lock()
-	manager.accountStoreReady = true
-	manager.mu.Unlock()
-
-	service := &Service{codexAccounts: manager, readiness: newReadinessCoordinator(readinessCoordinatorConfig{})}
-	store := &coordinatorSwitchStoreFake{}
-	coordinator := newCodexAccountSwitchCoordinator(context.Background(), service, store, codexops.NewGate(), time.Now, nil)
-
-	if _, err := coordinator.StartCodexAccountSwitch(context.Background(), ports.CodexAccountSwitchConfig{
-		TargetAccountID: target.Snapshot.ID, ExpectedAccountRevision: 0, IdempotencyKey: "use-saved-account",
-	}); err != nil {
+	if _, err := coordinator.StartCodexAccountSwitch(context.Background(), ports.CodexAccountSwitchConfig{TargetAccountID: "target", IdempotencyKey: "request-1"}); err != nil {
 		t.Fatal(err)
 	}
 	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -231,42 +152,180 @@ func TestCodexAccountSwitchCoordinatorActivatesSavedAccountWhenDeviceCredentialI
 	store.mu.Lock()
 	completed := store.record
 	store.mu.Unlock()
-	if completed.Phase != domain.CodexAccountSwitchCompleted || completed.SourceKind != domain.CodexAccountSwitchSourceNone {
-		t.Fatalf("switch = %#v, want completed switch from no device account", completed)
-	}
-	active := service.CurrentCodexActiveAccount()
-	if active.AccountID != target.Snapshot.ID || active.Revision != 1 {
-		t.Fatalf("active account = %#v", active)
-	}
-	installed, err := readDeviceOpaqueCredential(manager.globalCredentialPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(installed, credential) {
-		t.Fatal("saved credential was not installed as the device credential")
-	}
-}
-
-func TestCodexAccountSwitchCoordinatorRollsBackActivationFailure(t *testing.T) {
-	credentials := &coordinatorCredentialFake{
-		active: domain.CodexActiveAccount{AccountID: "source", Revision: 1}, activateErr: errors.New("activate failed"),
-	}
-	store := &coordinatorSwitchStoreFake{record: domain.CodexAccountSwitch{
-		ID: "switch-1", SourceKind: domain.CodexAccountSwitchSourceManaged,
-		SourceAccountID: "source", TargetAccountID: "target", ExpectedAccountRevision: 1,
-		Phase: domain.CodexAccountSwitchActivatingAccount,
-	}}
-	coordinator := newCodexAccountSwitchCoordinator(context.Background(), credentials, store, codexops.NewGate(), time.Now, nil)
-	sw := store.record
-	coordinator.dispatchCodexAccountSwitch(context.Background(), credentials, store, &sw)
-
-	if sw.Phase != domain.CodexAccountSwitchFailed || sw.FailureCode != "activation_unconfirmed" {
-		t.Fatalf("switch = (%q,%q), want failed activation_unconfirmed", sw.Phase, sw.FailureCode)
+	if completed.Phase != domain.CodexAccountSwitchCompleted {
+		t.Fatalf("phase = %q, want completed", completed.Phase)
 	}
 	credentials.mu.Lock()
 	calls := append([]string(nil), credentials.calls...)
 	credentials.mu.Unlock()
-	if !slices.Contains(calls, "restore:source") || !slices.Contains(calls, "verify-current:source") {
-		t.Fatalf("rollback calls = %v", calls)
+	for _, prefix := range []string{"store", "begin", "prepare:", "activate:", "confirm:", "cleanup:", "end", "reconcile"} {
+		if !slices.ContainsFunc(calls, func(call string) bool { return strings.HasPrefix(call, prefix) }) {
+			t.Fatalf("calls = %v, missing %q", calls, prefix)
+		}
+	}
+}
+
+func TestSwitchAdmissionCancelledBeforeWorkerLeavesNoPendingJournal(t *testing.T) {
+	credentials := &coordinatorCredentialFake{source: domain.CodexAccountSwitchSource{Kind: domain.CodexAccountSwitchSourceManaged, AccountID: "source"}}
+	store := &coordinatorSwitchStoreFake{}
+	coordinator := newCodexAccountSwitchCoordinator(context.Background(), credentials, store, codexops.NewGate(), time.Now, nil)
+	if err := coordinator.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := coordinator.StartCodexAccountSwitch(context.Background(), ports.CodexAccountSwitchConfig{TargetAccountID: "target", IdempotencyKey: "request-cancelled"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	store.mu.Lock()
+	settled := store.record
+	store.mu.Unlock()
+	if settled.Phase != domain.CodexAccountSwitchFailed || settled.FailureCode != "switch_cancelled_before_mutation" {
+		t.Fatalf("switch = (%q,%q), want terminal pre-mutation cancellation", settled.Phase, settled.FailureCode)
+	}
+	credentials.mu.Lock()
+	calls := append([]string(nil), credentials.calls...)
+	credentials.mu.Unlock()
+	if slices.ContainsFunc(calls, func(call string) bool { return strings.HasPrefix(call, "activate:") }) {
+		t.Fatalf("cancelled admission mutated credentials: %v", calls)
+	}
+	if !slices.ContainsFunc(calls, func(call string) bool { return strings.HasPrefix(call, "cleanup:") }) {
+		t.Fatalf("cancelled admission did not clean staging: %v", calls)
+	}
+}
+
+func TestInterruptedSwitchWithInstalledTargetCompletesLocally(t *testing.T) {
+	credentials := &coordinatorCredentialFake{installedTarget: true}
+	store := &coordinatorSwitchStoreFake{record: domain.CodexAccountSwitch{
+		ID: "switch-1", SourceKind: domain.CodexAccountSwitchSourceManaged, SourceAccountID: "source",
+		TargetAccountID: "target", Phase: domain.CodexAccountSwitchActivatingAccount,
+	}}
+	coordinator := newCodexAccountSwitchCoordinator(context.Background(), credentials, store, codexops.NewGate(), time.Now, nil)
+	if err := coordinator.ReconcileCodexAccountSwitches(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	if store.record.Phase != domain.CodexAccountSwitchCompleted {
+		t.Fatalf("phase = %q, want completed", store.record.Phase)
+	}
+}
+
+func TestInterruptedSwitchConclusiveNonTargetStatesCancelWithoutWriting(t *testing.T) {
+	for _, state := range []domain.CodexAccountSwitchInstallationState{
+		domain.CodexAccountSwitchSourceInstalled,
+		domain.CodexAccountSwitchCredentialMissing,
+		domain.CodexAccountSwitchExternalCredential,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			credentials := &coordinatorCredentialFake{inspectionState: state}
+			store := &coordinatorSwitchStoreFake{record: domain.CodexAccountSwitch{
+				ID: "switch-1", SourceKind: domain.CodexAccountSwitchSourceDevice,
+				TargetAccountID: "target", Phase: domain.CodexAccountSwitchRequested,
+			}}
+			coordinator := newCodexAccountSwitchCoordinator(context.Background(), credentials, store, codexops.NewGate(), time.Now, nil)
+			if err := coordinator.ReconcileCodexAccountSwitches(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := coordinator.Wait(waitCtx); err != nil {
+				t.Fatal(err)
+			}
+			if store.record.Phase != domain.CodexAccountSwitchFailed || store.record.FailureCode != "interrupted_switch_cancelled" {
+				t.Fatalf("switch = (%q,%q), want terminal cancellation", store.record.Phase, store.record.FailureCode)
+			}
+			credentials.mu.Lock()
+			defer credentials.mu.Unlock()
+			if slices.ContainsFunc(credentials.calls, func(call string) bool { return strings.HasPrefix(call, "activate:") }) {
+				t.Fatalf("recovery resumed credential mutation: %v", credentials.calls)
+			}
+		})
+	}
+}
+
+func TestInterruptedSwitchRetainsFenceAcrossTransientInspectionFailure(t *testing.T) {
+	transient := errors.New("temporary credential read failure")
+	credentials := &coordinatorCredentialFake{
+		installedTarget: true,
+		confirmErrs:     []error{transient, nil},
+		confirmStarted:  make(chan struct{}, 2),
+	}
+	store := &coordinatorSwitchStoreFake{record: domain.CodexAccountSwitch{
+		ID: "switch-1", SourceKind: domain.CodexAccountSwitchSourceManaged, SourceAccountID: "source",
+		TargetAccountID: "target", Phase: domain.CodexAccountSwitchActivatingAccount,
+	}}
+	gate := codexops.NewGate()
+	coordinator := newCodexAccountSwitchCoordinator(context.Background(), credentials, store, gate, time.Now, nil)
+	if err := coordinator.ReconcileCodexAccountSwitches(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-credentials.confirmStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first credential inspection did not run")
+	}
+	if !gate.ExclusivePendingOrHeld() {
+		t.Fatal("transient inspection released the Codex operation fence")
+	}
+	store.mu.Lock()
+	phaseAfterTransient := store.record.Phase
+	store.mu.Unlock()
+	if phaseAfterTransient.Terminal() {
+		t.Fatalf("transient inspection terminally settled switch as %q", phaseAfterTransient)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	if store.record.Phase != domain.CodexAccountSwitchCompleted {
+		t.Fatalf("phase = %q, want completed after retry", store.record.Phase)
+	}
+}
+
+func TestRecoveryReadFailureDoesNotClaimDaemonBlockingRecovery(t *testing.T) {
+	credentials := &coordinatorCredentialFake{}
+	store := &coordinatorSwitchStoreFake{readErr: errors.New("database busy")}
+	ctx, cancel := context.WithCancel(context.Background())
+	gate := codexops.NewGate()
+	coordinator := newCodexAccountSwitchCoordinator(ctx, credentials, store, gate, time.Now, nil)
+	if err := coordinator.ReconcileCodexAccountSwitches(context.Background()); err == nil {
+		t.Fatal("expected the initial diagnostic error")
+	}
+	if !gate.ExclusivePendingOrHeld() {
+		t.Fatal("startup recovery read failure left Codex launches unfenced")
+	}
+	cancel()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	if gate.ExclusivePendingOrHeld() {
+		t.Fatal("shutdown did not release the startup recovery fence")
+	}
+}
+
+func TestRecoveryWithoutPendingJournalReleasesStartupFence(t *testing.T) {
+	credentials := &coordinatorCredentialFake{}
+	store := &coordinatorSwitchStoreFake{}
+	gate := codexops.NewGate()
+	coordinator := newCodexAccountSwitchCoordinator(context.Background(), credentials, store, gate, time.Now, nil)
+
+	if err := coordinator.ReconcileCodexAccountSwitches(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gate.ExclusivePendingOrHeld() {
+		t.Fatal("no pending journal left the startup fence held")
+	}
+	credentials.mu.Lock()
+	defer credentials.mu.Unlock()
+	if !slices.Contains(credentials.calls, "cleanup-inactive:") {
+		t.Fatalf("inactive staging was not cleaned: %v", credentials.calls)
 	}
 }

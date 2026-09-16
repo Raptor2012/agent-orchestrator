@@ -40,10 +40,10 @@ func newCodexLaunchReadinessFixture(t *testing.T) *codexLaunchReadinessFixture {
 	if err := ensurePrivateDirectory(globalHome); err != nil {
 		t.Fatal(err)
 	}
-	state := &fakeCodexAccountStateStore{active: domain.CodexActiveAccount{AccountID: testAccountID, Revision: 1}, found: true}
+	state := &testCodexDeviceSeed{active: testCodexDeviceAccount{AccountID: testAccountID, Revision: 1}}
 	manager := newCodexAccountManager(context.Background(),
 		filepath.Join(root, "accounts"), filepath.Join(root, "pending"),
-		filepath.Join(root, "staging"), globalHome, nil, state, nil)
+		filepath.Join(root, "staging"), globalHome, nil, nil)
 	ids := []string{testAccountID, otherCodexAccountID, "6f8dfc76-8db4-4621-8974-c480093e0d55"}
 	manager.catalog.newID = func() string { id := ids[0]; ids = ids[1:]; return id }
 	manager.newID = func() string { return "b9a4e5c6-4f31-4b1a-9d2a-7b4a4c0f9a11" }
@@ -62,7 +62,7 @@ func newCodexLaunchReadinessFixture(t *testing.T) *codexLaunchReadinessFixture {
 	if err := writeGlobalCredentialAtomic(manager.globalCredentialPath(), activeCredential); err != nil {
 		t.Fatal(err)
 	}
-	manager.active = state.active
+	setTestDeviceAccount(manager, state.active)
 	manager.accountStoreReady = true
 	manager.reconciliation = domain.CodexDeviceReconciliation{Status: domain.CodexDeviceReconciliationVerified, ActiveAccountVerified: true, ReasonCode: "verified"}
 	manager.deviceAccountID = active.Snapshot.ID
@@ -207,8 +207,8 @@ func TestLaunchFallsBackToNativeReadinessOnTransientProtectedFailure(t *testing.
 	if latest.Snapshot.Authentication.State == domain.AgentAuthenticationUnauthorized {
 		t.Fatalf("transient provider failure signed the account out = %#v", latest.Snapshot.Authentication)
 	}
-	if latest.Snapshot.Authentication.Freshness != domain.AgentReadinessStale || latest.Snapshot.Authentication.ReasonCode != domain.AgentReadinessReasonAuthCheckFailed {
-		t.Fatalf("transient provider failure was not exposed as a retryable verification failure = %#v", latest.Snapshot.Authentication)
+	if latest.Snapshot.Authentication.State != domain.AgentAuthenticationAuthorized || latest.Snapshot.Authentication.Freshness != domain.AgentReadinessFresh {
+		t.Fatalf("transient capacity failure changed authentication = %#v", latest.Snapshot.Authentication)
 	}
 }
 
@@ -265,7 +265,7 @@ func TestAuthorizedInactiveAccountDoesNotMaskTheActiveAccount(t *testing.T) {
 	}
 }
 
-func TestSuccessfulReauthenticationRestoresLaunchReadiness(t *testing.T) {
+func TestSuccessfulReauthenticationKeepsCapacitySeparateFromLaunchReadiness(t *testing.T) {
 	fixture := newCodexLaunchReadinessFixture(t)
 	fixture.ensureSettings()
 
@@ -278,8 +278,8 @@ func TestSuccessfulReauthenticationRestoresLaunchReadiness(t *testing.T) {
 		t.Fatalf("Settings did not recover after reauthentication = %#v", active.Authentication)
 	}
 	launch, ok := fixture.service.structuredCodexAuthentication(context.Background(), string(domain.HarnessCodex), domain.AgentReadinessPurposeLaunch)
-	if !ok || launch.State != domain.AgentAuthenticationAuthorized {
-		t.Fatalf("launch readiness after reauthentication = %#v (structured=%t)", launch, ok)
+	if ok {
+		t.Fatalf("capacity success became a structured authentication decision = %#v", launch)
 	}
 }
 
@@ -361,7 +361,7 @@ func TestExternallyReplacedCredentialsDoNotGetAttributedToOldActiveSlot(t *testi
 	}
 
 	view = fixture.manager.cached()
-	if view.ActiveAccountID == fixture.active.Snapshot.ID || len(view.Accounts) != 3 || view.UnmanagedGlobalAccount != nil {
+	if view.ActiveAccountID == fixture.active.Snapshot.ID || len(view.Accounts) != 3 {
 		t.Fatalf("external account was not imported separately = %#v", view)
 	}
 	saved, err := readOpaqueCredential(filepath.Join(fixture.active.Home, codexCredentialFilename))

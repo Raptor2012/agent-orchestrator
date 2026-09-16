@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CodexAccountsResponse } from "./useCodexAccountsQuery";
 import { catalogFor } from "../i18n/messages";
 import type { AppLocale } from "../i18n/locales";
-import { codexAccountReasonCodes, codexAccountReasonKey, codexAuthenticationDisplay, codexSwitchDisplay, mergeCodexAccounts } from "./codex-accounts-state";
+import { codexAccountCanSwitch, codexAccountReasonCodes, codexAccountReasonKey, codexAuthenticationDisplay, codexSwitchDisplay, mergeCodexAccounts } from "./codex-accounts-state";
 import type { CodexAccountSwitch } from "./useCodexAccountsQuery";
 
 const account = (id: string, createdAt: string, active = false) => ({ id, createdAt, active });
@@ -45,13 +45,14 @@ describe("mergeCodexAccounts", () => {
 		]);
 	});
 
-	it("keeps the last matched active row stable during a targeted reconciliation check", () => {
+	it("shows no active row until local reconciliation verifies device ownership", () => {
 		const current = response([
 			account("a", "2026-01-02T00:00:00Z", true),
 			account("b", "2026-01-01T00:00:00Z"),
 		], "a");
 		const incoming = {
 			...response([account("a", "2026-01-02T00:00:00Z")], "a"),
+			activeAccountId: undefined,
 			deviceReconciliation: {
 				status: "checking",
 				activeAccountVerified: false,
@@ -63,8 +64,8 @@ describe("mergeCodexAccounts", () => {
 		const merged = mergeCodexAccounts(current, incoming, "preserveMissing");
 
 		expect(merged.accounts.map(({ id, active }) => [id, active])).toEqual([
-			["a", true],
 			["b", false],
+			["a", false],
 		]);
 	});
 
@@ -112,49 +113,32 @@ describe("codexAuthenticationDisplay", () => {
 	});
 });
 
-it("keeps account mutations fenced while recovery is required", () => {
+it("allows a locally valid saved credential to switch regardless of cached authentication", () => {
+	expect(codexAccountCanSwitch({ status: "valid" })).toBe(true);
+	expect(codexAccountCanSwitch({ status: "signed_out" })).toBe(false);
+});
+
+it("automatically settles legacy recovery journals as switch progress", () => {
 	const display = codexSwitchDisplay({
 		id: "switch-1",
 		sourceKind: "managed",
 		sourceAccountId: "account-a",
 		targetAccountId: "account-b",
 		phase: "recovery_required",
-		canRecover: true,
 		createdAt: "2026-09-02T00:00:00Z",
 		updatedAt: "2026-09-02T00:01:00Z",
 	} satisfies CodexAccountSwitch);
 
-	expect(display.busy).toBe(false);
+	expect(display.busy).toBe(true);
 	expect(display.mutationBlocked).toBe(true);
-	expect(display.canRecover).toBe(true);
-});
-
-	it("shows active rollback as progress and exposes interrupted rollback recovery", () => {
-		const active = codexSwitchDisplay({
-			id: "switch-1", sourceKind: "managed", sourceAccountId: "account-a", targetAccountId: "account-b",
-			phase: "rollback_required", failureCode: "activation_unconfirmed", canRecover: false,
-			createdAt: "2026-09-02T00:00:00Z", updatedAt: "2026-09-02T00:01:00Z",
-	} satisfies CodexAccountSwitch);
-	expect(active.key).toBe("settings.codexAccounts.switch.rollback_required");
-	expect(active.busy).toBe(true);
-	expect(active.mutationBlocked).toBe(true);
-	expect(active.canRecover).toBe(false);
-
-		const interrupted = codexSwitchDisplay({
-			id: "switch-1", sourceKind: "managed", sourceAccountId: "account-a", targetAccountId: "account-b",
-			phase: "rollback_required", failureCode: "activation_unconfirmed", canRecover: true,
-			createdAt: "2026-09-02T00:00:00Z", updatedAt: "2026-09-02T00:01:00Z",
-	} satisfies CodexAccountSwitch);
-	expect(interrupted.busy).toBe(false);
-	expect(interrupted.mutationBlocked).toBe(true);
-	expect(interrupted.canRecover).toBe(true);
+	expect(display.key).toBe("settings.codexAccounts.switch.requested");
 });
 
 it("presents every normal credential phase as the same switch progress", () => {
-	for (const phase of ["requested", "checkpointing_source", "activating_target", "verifying_target"] as const) {
+	for (const phase of ["requested", "checkpointing_source", "activating_target"] as const) {
 		const display = codexSwitchDisplay({
 			id: "switch-in-progress", sourceKind: "managed", sourceAccountId: "account-a", targetAccountId: "account-b",
-			phase, canRecover: false,
+			phase,
 			createdAt: "2026-09-02T00:00:00Z", updatedAt: "2026-09-02T00:01:00Z",
 		} satisfies CodexAccountSwitch);
 		expect(display.key).toBe("settings.codexAccounts.switch.requested");
@@ -163,7 +147,7 @@ it("presents every normal credential phase as the same switch progress", () => {
 
 it("maps every account reason to complete native locale copy with a safe unknown fallback", () => {
 	const locales: AppLocale[] = ["en", "de", "es", "fr", "ja", "ko", "pt-BR", "zh-CN"];
-	const switchKeys = ["requested", "checkpointing_source", "activating_target", "verifying_target", "rollback_required", "recovery_required", "completed", "failed", "unknown"].map((phase) => `settings.codexAccounts.switch.${phase}`);
+	const switchKeys = ["requested", "completed", "failed", "unknown"].map((phase) => `settings.codexAccounts.switch.${phase}`);
 	const keys = [
 		...codexAccountReasonCodes.map(codexAccountReasonKey),
 		...switchKeys,
@@ -175,10 +159,8 @@ it("maps every account reason to complete native locale copy with a safe unknown
 		"settings.codexAccounts.authenticationRetryFailed",
 		"settings.codexAccounts.retryingAuthentication",
 		"settings.codexAccounts.tryAgain",
-		"settings.codexAccounts.noActiveAccount",
 		"settings.codexAccounts.deviceRefreshFailed",
-		"settings.codexAccounts.switch.restored",
-		"settings.codexAccounts.retryRecovery",
+		"settings.codexAccounts.switch.unchanged",
 	];
 	for (const locale of locales) {
 		const catalog = catalogFor(locale);
