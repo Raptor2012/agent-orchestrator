@@ -3,13 +3,124 @@
 package agent
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+func TestCodexWindowsDACLRejectsUnsupportedEffectiveAllowACEs(t *testing.T) {
+	user := currentWindowsTestUser(t)
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedInstaller, err := codexWindowsTrustedInstallerSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	untrusted, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, aceType := range map[string]uint8{
+		"compound allow":        0x04,
+		"object allow":          0x05,
+		"callback allow":        0x09,
+		"callback object allow": 0x0b,
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, dacl := windowsRawTestDACL(t, aceType, 0, codexWindowsGenericRead, untrusted)
+			_, parseErr := codexWindowsDACLACEs(dacl, user, system, administrators, trustedInstaller, nil, false)
+			runtime.KeepAlive(raw)
+			if parseErr == nil {
+				t.Fatalf("effective ACE type %#x was accepted", aceType)
+			}
+		})
+	}
+}
+
+func TestCodexWindowsDACLKeepsKnownDeniesAndInheritOnlyNonGranting(t *testing.T) {
+	user := currentWindowsTestUser(t)
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedInstaller, err := codexWindowsTrustedInstallerSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	untrusted, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		aceType uint8
+		flags   uint8
+	}{
+		"simple deny":                 {aceType: windows.ACCESS_DENIED_ACE_TYPE},
+		"object deny":                 {aceType: codexWindowsAccessDeniedObjectACEType},
+		"callback deny":               {aceType: codexWindowsAccessDeniedCallbackACEType},
+		"callback object deny":        {aceType: codexWindowsAccessDeniedCallbackObjectACEType},
+		"inherit-only compound allow": {aceType: 0x04, flags: windows.INHERIT_ONLY_ACE},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, dacl := windowsRawTestDACL(t, tc.aceType, tc.flags, codexWindowsGenericAll, untrusted)
+			aces, parseErr := codexWindowsDACLACEs(dacl, user, system, administrators, trustedInstaller, nil, false)
+			runtime.KeepAlive(raw)
+			if parseErr != nil {
+				t.Fatalf("non-granting ACE rejected: %v", parseErr)
+			}
+			if len(aces) != 0 {
+				t.Fatalf("non-granting ACE produced policy entries: %#v", aces)
+			}
+		})
+	}
+}
+
+func windowsRawTestDACL(t *testing.T, aceType, aceFlags uint8, mask uint32, sid *windows.SID) ([]byte, *windows.ACL) {
+	t.Helper()
+	if sid == nil || !sid.IsValid() {
+		t.Fatal("raw test ACL requires a valid SID")
+	}
+	extraPrefix := 0
+	aclRevision := byte(2)
+	switch aceType {
+	case 0x04: // ACCESS_ALLOWED_COMPOUND_ACE_TYPE
+		extraPrefix = 4
+	case 0x05, 0x06, 0x0b, 0x0c: // object ACE layouts
+		extraPrefix = 4
+		aclRevision = 4
+	}
+	aceSize := 8 + extraPrefix + sid.Len()
+	aclSize := 8 + aceSize
+	raw := make([]byte, aclSize)
+	raw[0] = aclRevision
+	binary.LittleEndian.PutUint16(raw[2:4], uint16(aclSize))
+	binary.LittleEndian.PutUint16(raw[4:6], 1)
+	raw[8] = aceType
+	raw[9] = aceFlags
+	binary.LittleEndian.PutUint16(raw[10:12], uint16(aceSize))
+	binary.LittleEndian.PutUint32(raw[12:16], mask)
+	if aceType == 0x04 {
+		binary.LittleEndian.PutUint16(raw[16:18], 1) // COMPOUND_ACE_IMPERSONATION
+	}
+	sidOffset := 16 + extraPrefix
+	copy(raw[sidOffset:], unsafe.Slice((*byte)(unsafe.Pointer(sid)), sid.Len()))
+	return raw, (*windows.ACL)(unsafe.Pointer(&raw[0]))
+}
 
 func TestOpenCodexDeviceFileRepairsLegacyUnmappedSID(t *testing.T) {
 	path := newWindowsDeviceCredentialTestFile(t)

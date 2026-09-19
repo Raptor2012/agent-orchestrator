@@ -25,6 +25,12 @@ type codexWindowsACEPrefix struct {
 	mask   windows.ACCESS_MASK
 }
 
+const (
+	codexWindowsAccessDeniedObjectACEType         uint8 = 0x06
+	codexWindowsAccessDeniedCallbackACEType       uint8 = 0x0a
+	codexWindowsAccessDeniedCallbackObjectACEType uint8 = 0x0c
+)
+
 type codexWindowsACLPolicy uint8
 
 const (
@@ -272,7 +278,6 @@ func codexWindowsHandleSecurityState(handle windows.Handle, classifyDevicePrinci
 	if err != nil || dacl == nil {
 		return ownerCurrent, ownerTrusted, nil, errors.New("codex path DACL is unavailable")
 	}
-	header := (*codexWindowsACLHeader)(unsafe.Pointer(dacl))
 	var sandbox *windows.SID
 	if classifyDevicePrincipals {
 		resolved, sandboxErr := codexWindowsLocalSandboxSID()
@@ -280,34 +285,58 @@ func codexWindowsHandleSecurityState(handle windows.Handle, classifyDevicePrinci
 			sandbox = resolved
 		}
 	}
+	aces, err := codexWindowsDACLACEs(dacl, user.User.Sid, system, administrators, trustedInstaller, sandbox, classifyDevicePrincipals)
+	if err != nil {
+		return ownerCurrent, ownerTrusted, nil, err
+	}
+	return ownerCurrent, ownerTrusted, aces, nil
+}
+
+func codexWindowsDACLACEs(
+	dacl *windows.ACL,
+	user, system, administrators, trustedInstaller, sandbox *windows.SID,
+	classifyDevicePrincipals bool,
+) ([]codexWindowsACE, error) {
+	header := (*codexWindowsACLHeader)(unsafe.Pointer(dacl))
 	aces := make([]codexWindowsACE, 0, header.count)
 	for index := uint32(0); index < uint32(header.count); index++ {
 		var raw *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, index, &raw); err != nil || raw == nil {
-			return ownerCurrent, ownerTrusted, nil, errors.New("codex path ACL is unreadable")
+			return nil, errors.New("codex path ACL is unreadable")
 		}
 		prefix := (*codexWindowsACEPrefix)(unsafe.Pointer(raw))
 		if prefix.header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
 			continue
 		}
-		allowed := prefix.header.AceType == windows.ACCESS_ALLOWED_ACE_TYPE
-		ace := codexWindowsACE{Allowed: allowed, Mask: uint32(prefix.mask)}
-		if allowed {
+		switch prefix.header.AceType {
+		case windows.ACCESS_ALLOWED_ACE_TYPE:
+			ace := codexWindowsACE{Allowed: true, Mask: uint32(prefix.mask)}
 			sid := (*windows.SID)(unsafe.Pointer(&raw.SidStart))
-			if sid.IsValid() {
-				ace.PrincipalTrusted = sid.Equals(user.User.Sid) || sid.Equals(system) || sid.Equals(administrators) || sid.Equals(trustedInstaller)
-				ace.PrincipalSandbox = sandbox != nil && sid.Equals(sandbox)
-				if classifyDevicePrincipals && !ace.PrincipalTrusted && !ace.PrincipalSandbox {
-					_, _, _, lookupErr := sid.LookupAccount("")
-					ace.PrincipalUnmapped = errors.Is(lookupErr, windows.ERROR_NONE_MAPPED)
-				}
+			if !sid.IsValid() {
+				return nil, errors.New("codex path ACL contains an invalid allow ACE")
 			}
-		} else if prefix.header.AceType == 5 || prefix.header.AceType == 9 || prefix.header.AceType == 11 {
-			ace.Allowed = true
+			ace.PrincipalTrusted = sid.Equals(user) || sid.Equals(system) || sid.Equals(administrators) || sid.Equals(trustedInstaller)
+			ace.PrincipalSandbox = sandbox != nil && sid.Equals(sandbox)
+			if classifyDevicePrincipals && !ace.PrincipalTrusted && !ace.PrincipalSandbox {
+				_, _, _, lookupErr := sid.LookupAccount("")
+				ace.PrincipalUnmapped = errors.Is(lookupErr, windows.ERROR_NONE_MAPPED)
+			}
+			aces = append(aces, ace)
+		case windows.ACCESS_DENIED_ACE_TYPE,
+			codexWindowsAccessDeniedObjectACEType,
+			codexWindowsAccessDeniedCallbackACEType,
+			codexWindowsAccessDeniedCallbackObjectACEType:
+			// Deny ACEs cannot grant access. Their trustee layout is irrelevant to
+			// these policies, so leave them to the Windows access check.
+			continue
+		default:
+			// Compound, object, and callback allow ACEs have layouts or semantics
+			// this decoder does not implement. Reject them rather than risk
+			// treating an effective grant as a harmless non-allow ACE.
+			return nil, errors.New("codex path ACL contains an unsupported effective ACE")
 		}
-		aces = append(aces, ace)
 	}
-	return ownerCurrent, ownerTrusted, aces, nil
+	return aces, nil
 }
 
 // codexWindowsTrustedInstallerSIDString is NT SERVICE\TrustedInstaller. Windows

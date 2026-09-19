@@ -22,6 +22,12 @@ type accountHomeACEPrefix struct {
 	mask   windows.ACCESS_MASK
 }
 
+const (
+	accountHomeAccessDeniedObjectACEType         uint8 = 0x06
+	accountHomeAccessDeniedCallbackACEType       uint8 = 0x0a
+	accountHomeAccessDeniedCallbackObjectACEType uint8 = 0x0c
+)
+
 // managedHomePrivate reports whether an AO-owned Codex credential home is still
 // private to this user.
 //
@@ -83,6 +89,10 @@ func managedHomePrivate(path string, _ os.FileInfo) bool {
 	if err != nil || dacl == nil {
 		return false
 	}
+	return managedHomeDACLPrivate(dacl, user.User.Sid, system, administrators)
+}
+
+func managedHomeDACLPrivate(dacl *windows.ACL, user, system, administrators *windows.SID) bool {
 	header := (*accountHomeACLHeader)(unsafe.Pointer(dacl))
 	for index := uint32(0); index < uint32(header.count); index++ {
 		var raw *windows.ACCESS_ALLOWED_ACE
@@ -93,16 +103,24 @@ func managedHomePrivate(path string, _ os.FileInfo) bool {
 		if prefix.header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
 			continue
 		}
-		// Every callback and object allow ACE type is treated as an allow ACE:
-		// the conditional expression is not evaluated here, so it cannot be
-		// relied on to withhold the access the ACE grants.
-		allowed := prefix.header.AceType == windows.ACCESS_ALLOWED_ACE_TYPE ||
-			prefix.header.AceType == 5 || prefix.header.AceType == 9 || prefix.header.AceType == 11
-		if !allowed || uint32(prefix.mask) == 0 {
+		switch prefix.header.AceType {
+		case windows.ACCESS_ALLOWED_ACE_TYPE:
+			if uint32(prefix.mask) == 0 {
+				continue
+			}
+			sid := (*windows.SID)(unsafe.Pointer(&raw.SidStart))
+			if !sid.IsValid() || (!sid.Equals(user) && !sid.Equals(system) && !sid.Equals(administrators)) {
+				return false
+			}
+		case windows.ACCESS_DENIED_ACE_TYPE,
+			accountHomeAccessDeniedObjectACEType,
+			accountHomeAccessDeniedCallbackACEType,
+			accountHomeAccessDeniedCallbackObjectACEType:
+			// Deny ACEs cannot make the managed home less private.
 			continue
-		}
-		sid := (*windows.SID)(unsafe.Pointer(&raw.SidStart))
-		if !sid.Equals(user.User.Sid) && !sid.Equals(system) && !sid.Equals(administrators) {
+		default:
+			// Only the simple allow layout above is decoded. Fail closed for
+			// every other effective ACE instead of guessing where its SID lives.
 			return false
 		}
 	}
